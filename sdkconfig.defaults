@@ -1,0 +1,11 @@
+# Timing: 1 ms ticks so vTaskDelay(pdMS_TO_TICKS(15)) really waits 15 ms
+CONFIG_FREERTOS_HZ=1000
+
+# Send logs over the XIAO's USB-C port
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+
+# The XIAO ESP32S3 has 8 MB of flash (ESP-IDF assumes 2 MB by default)
+CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
+
+# Keep the brownout detector on (it's the default; see note below)
+CONFIG_ESP_BROWNOUT_DET=y
