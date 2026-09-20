@@ -9,29 +9,22 @@
 #define TAG "servos"
 
 #define SERVO_FREQ_HZ 50
-#define SERVO_RES LEDC_TIMER_13_BIT
-#define SERVO_MAX_DUTY ((1<<14) - 1)
+#define SERVO_RES LEDC_TIMER_14_BIT
+#define SERVO_MAX_DUTY (1u << SERVO_RES)
 #define PERIOD_US 20000
 
 #define RAW_MIN_US 400
 #define RAW_MAX_US 2600
-#define US_PER_KEY      6                 // pulse change per key repeat
-#define MARGIN_US       15
+#define US_PER_KEY      2                 // pulse change per key repeat
+#define MARGIN_US       20
 
 // GPIO mappings
 #define BTN_CAL   GPIO_NUM_4   // D3
 #define BTN_UP    GPIO_NUM_5   // D4
 #define BTN_DOWN  GPIO_NUM_6    // index in SERVO_PINS (D1) - top servo, tilts up/over
 
-// Pan and tilt
-#define PAN_MIN    0
-#define PAN_MAX    180
-#define TILT_MIN   15
-#define TILT_MAX   165
-#define EL_MIN  ((TILT_MIN) > (180 - TILT_MAX) ? (TILT_MIN) : (180 - TILT_MAX))
-
 // Servo speed settings
-#define STEP_DEG       1     // max degrees per update (speed); 6 = 300°/s
+#define STEP_DEG       2     // max degrees per update (speed); 6 = 300°/s
 #define UPDATE_MS      20    // one servo update period
 
 // Buttons settings
@@ -94,10 +87,6 @@ static int clamp(int v, int min_v, int max_v) {
     return v < min_v ? min_v : (v > max_v ? max_v: v);
 }
 
-static int clampi(int v, int lo, int hi) { 
-    return v < lo ? lo : (v > hi ? hi : v); 
-}
-
 // Move servo
 static void servo_write_us(int servo, int pwidth) {
     pwidth = clamp(pwidth, RAW_MIN_US, RAW_MAX_US);
@@ -131,13 +120,13 @@ static int nudge_to_end(int servo, const char *name, const char *which) {
     while (1) {
         if (pressed(BTN_CAL)) break;            // confirm setting
         if (pressed(BTN_UP))   {
-            us = clampi(us + US_PER_STEP, RAW_MIN_US, RAW_MAX_US);
+            us = clamp(us + US_PER_STEP, RAW_MIN_US, RAW_MAX_US);
         }
         if (pressed(BTN_DOWN)) {
-            us = clampi(us - US_PER_STEP, RAW_MIN_US, RAW_MAX_US);
+            us = clamp(us - US_PER_STEP, RAW_MIN_US, RAW_MAX_US);
         }
         servo_write_us(servo, us);
-        ESP_LOGI(TAG, "  %s %s: %d us   \r", name, which, us);
+        //ESP_LOGI(TAG, "  %s %s: %d us   \r", name, which, us);
         fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(50));
     }
@@ -173,8 +162,7 @@ static void run_calibration(void) {
 
     // Save new servos config
     bool ok = save_config(&config);
-    ESP_LOGI(TAG, "Calibration %s: pan %d..%d, tilt %d..%d",
-             ok ? "saved" : "SAVE FAILED", pan_min, pan_max, tilt_min, tilt_max);
+    ESP_LOGI(TAG, "Calibration %s: pan %d..%d, tilt %d..%d", ok ? "saved" : "SAVE FAILED", pan_min, pan_max, tilt_min, tilt_max);
 
 }
 
@@ -183,18 +171,21 @@ static void scan_routine(void) {
     ESP_LOGI(TAG, "Doing scan routine");
     while (1) {
         for (int angle = 0; angle <= 180; angle += STEP_DEG) {
-            for (int s = 0; s < NUM_SERVOS; ++s) {
-                servo_write_angle(s, angle);
-            }
-            vTaskDelay(pdMS_TO_TICKS(UPDATE_MS));
+            servo_write_angle(PAN_SERVO, angle);
+            vTaskDelay(pdMS_TO_TICKS(UPDATE_MS/2));
+            servo_write_angle(TILT_SERVO, angle);
+            vTaskDelay(pdMS_TO_TICKS(UPDATE_MS/2));
         }
         vTaskDelay(pdMS_TO_TICKS(500));
 
         for (int angle = 180; angle >= 0; angle -= STEP_DEG) {
             for (int s = 0; s < NUM_SERVOS; ++s) {
-                servo_write_angle(s, angle);
+                servo_write_angle(PAN_SERVO, angle);
+                vTaskDelay(pdMS_TO_TICKS(UPDATE_MS/2));
+                servo_write_angle(TILT_SERVO, angle);
+                vTaskDelay(pdMS_TO_TICKS(UPDATE_MS/2));
             }
-            vTaskDelay(pdMS_TO_TICKS(UPDATE_MS));
+
         }
         vTaskDelay(pdMS_TO_TICKS(500));
     }
@@ -244,28 +235,3 @@ void app_main(void) {
     scan_routine();
     
 }
-
-// void app_main(void)
-// {
-//     vTaskDelay(pdMS_TO_TICKS(5000)); 
-//     servo_init();
-//     ESP_LOGI(TAG, "Servos initialized");
-//     vTaskDelay(pdMS_TO_TICKS(2000)); 
-
-//     for (int i = 0; i < NUM_SERVOS; i++) servo_write_angle(i, 90);  // center
-//     vTaskDelay(pdMS_TO_TICKS(1000));
-
-//     while (1) {
-//         for (int a = 0; a <= 180; a += 2) {
-//             for (int i = 0; i < NUM_SERVOS; i++) servo_write_angle(i, a);
-//             vTaskDelay(pdMS_TO_TICKS(15));
-//         }
-//         vTaskDelay(pdMS_TO_TICKS(500));
-
-//         for (int a = 180; a >= 0; a -= 2) {
-//             for (int i = 0; i < NUM_SERVOS; i++) servo_write_angle(i, a);
-//             vTaskDelay(pdMS_TO_TICKS(15));
-//         }
-//         vTaskDelay(pdMS_TO_TICKS(500));
-//     }
-// }

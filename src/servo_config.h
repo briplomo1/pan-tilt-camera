@@ -27,7 +27,7 @@ typedef struct {
 static const servo_config DEFAULTS = {
     .version = 1,
     .min_us = {400, 400},
-    .max_us = {2600, 2600},
+    .max_us = {2500, 2500},
     .pan_min = 0.0f,
     .pan_max = 180.0f,
     .tilt_min = 15.0f,
