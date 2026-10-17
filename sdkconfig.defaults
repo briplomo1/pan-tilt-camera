@@ -9,3 +9,20 @@ CONFIG_ESPTOOLPY_FLASHSIZE_8MB=y
 
 # Keep the brownout detector on (it's the default; see note below)
 CONFIG_ESP_BROWNOUT_DET=y
+
+# --- Camera + face detection ---
+# Use partitions.csv (3 MB app slot; the face model is linked into the app)
+CONFIG_PARTITION_TABLE_CUSTOM=y
+CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="partitions.csv"
+
+# 8 MB octal PSRAM on the XIAO: camera frame buffers and model tensors live here
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+
+# Full speed and bigger caches; ESP-DL inference is ~2x faster with these
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+CONFIG_ESP32S3_DATA_CACHE_64KB=y
+CONFIG_ESP32S3_DATA_CACHE_LINE_64B=y
+CONFIG_ESP32S3_INSTRUCTION_CACHE_32KB=y
+CONFIG_COMPILER_OPTIMIZATION_PERF=y

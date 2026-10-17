@@ -1,3 +1,5 @@
+#pragma once
+
 #include <chrono>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"

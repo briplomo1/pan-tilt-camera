@@ -1,5 +1,5 @@
 #include "Servo.h"
-#include <string>
+#include <algorithm>
 #include "esp_log.h"
 
 namespace {
@@ -28,6 +28,7 @@ Servo::Servo(gpio_num_t pin) : pin_(pin) {
         ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
     }
     channel_ = static_cast<ledc_channel_t>(freeIndex);
+    usedChannels_ |= 1u << freeIndex;
 
     if (!timerReady_) {
         ledc_timer_config_t config = {};
@@ -44,5 +45,36 @@ Servo::Servo(gpio_num_t pin) : pin_(pin) {
 
     ledc_channel_config_t ch = {};
     ch.gpio_num = pin_;
+    ch.speed_mode = mode;
+    ch.channel = channel_;
+    ch.timer_sel = timer;
+    ch.duty = 0;
+    ch.hpoint = 0;
+    ESP_ERROR_CHECK(ledc_channel_config(&ch));
+}
 
+Servo::~Servo() {
+    stop();
+    usedChannels_ &= ~(1u << channel_);
+}
+
+void Servo::setRange(int low_us, int high_us) {
+    lowUs_ = std::clamp(low_us, minUs_, maxUs_);
+    highUs_ = std::clamp(high_us, minUs_, maxUs_);
+}
+
+void Servo::writeUS(int us) const {
+    us = std::clamp(us, minUs_, maxUs_);
+    uint32_t duty = static_cast<uint32_t>(us) * dutySteps / periodUs;
+    ledc_set_duty(mode, channel_, duty);
+    ledc_update_duty(mode, channel_);
+}
+
+void Servo::writeAngle(float angle) const {
+    angle = std::clamp(angle, 0.0f, 180.0f);
+    writeUS(lowUs_ + static_cast<int>(angle * (highUs_ - lowUs_) / 180.0f + 0.5f));
+}
+
+void Servo::stop() const {
+    ledc_stop(mode, channel_, 0);
 }

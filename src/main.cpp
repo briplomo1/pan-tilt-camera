@@ -1,64 +1,35 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "driver/ledc.h"
 #include "esp_log.h"
 #include "servo_config.h"
 #include "driver/gpio.h"
 #include <stdio.h>
+#include <algorithm>
+#include "Servo.h"
+#include "PanTilt.h"
+#include "Camera.h"
+#include "FaceDetector.h"
+#include "Tracker.h"
 
 #define TAG "servos"
 
-#define SERVO_FREQ_HZ 50
-#define SERVO_RES LEDC_TIMER_14_BIT
-#define SERVO_MAX_DUTY (1u << SERVO_RES)
-#define PERIOD_US 20000
-
 #define RAW_MIN_US 400
 #define RAW_MAX_US 2600
-#define US_PER_KEY      2                 // pulse change per key repeat
 #define MARGIN_US       20
 
 // GPIO mappings
 #define BTN_CAL   GPIO_NUM_4   // D3
 #define BTN_UP    GPIO_NUM_5   // D4
-#define BTN_DOWN  GPIO_NUM_6    // index in SERVO_PINS (D1) - top servo, tilts up/over
-
-// Servo speed settings
-#define STEP_DEG       2     // max degrees per update (speed); 6 = 300°/s
-#define UPDATE_MS      20    // one servo update period
+#define BTN_DOWN  GPIO_NUM_6   // D5
 
 // Buttons settings
 #define US_PER_STEP     6
 
+// Tracker runs on core 1 so detection never competes with the servo task on core 0
+#define TRACKER_STACK   16384
+#define TRACKER_PRIO    3
+
 static servo_config config;
-
-static void servo_init(void) {
-    // Define pwm timer
-    ledc_timer_config_t timer = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = LEDC_TIMER_0,
-        .duty_resolution = SERVO_RES,
-        .freq_hz = SERVO_FREQ_HZ,
-        .clk_cfg = LEDC_AUTO_CLK,
-    };
-    // Set pwm timer
-    ESP_ERROR_CHECK(ledc_timer_config(&timer));
-
-    // Configure each led channel
-    for(int i=0;i<NUM_SERVOS;++i) {
-        // Define gpio channel config
-        ledc_channel_config_t ch = {
-            .gpio_num = SERVO_PINS[i],
-            .speed_mode = LEDC_LOW_SPEED_MODE,
-            .channel = (ledc_channel_t)i,
-            .timer_sel = LEDC_TIMER_0,
-            .duty = 0,
-            .hpoint = 0,
-        };
-        // Set channel config
-        ESP_ERROR_CHECK(ledc_channel_config(&ch));
-    }
-}
 
 // Init button gpios
 static void buttons_init(void) {
@@ -81,35 +52,10 @@ static bool pressed(gpio_num_t pin) {
     return false;
 }
 
-// Keeps voltage to a certain range given a minimmum 
-// and maximum values of that range
-static int clamp(int v, int min_v, int max_v) {
-    return v < min_v ? min_v : (v > max_v ? max_v: v);
-}
-
-// Move servo
-static void servo_write_us(int servo, int pwidth) {
-    pwidth = clamp(pwidth, RAW_MIN_US, RAW_MAX_US);
-    uint32_t duty = (uint32_t)pwidth * SERVO_MAX_DUTY / PERIOD_US;
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)servo, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, (ledc_channel_t)servo);
-    //ESP_LOGI(TAG, "Wrote to servo %d", servo);
-}
-
-// Move servo to angle
-static void servo_write_angle(int servo, int angle) {
-    angle = clamp(angle, 0, 180);
-    int lo = config.min_us[servo];
-    int hi = config.max_us[servo];
-    int us = lo + angle * (hi - lo) / 180; 
-    //ESP_LOGI(TAG, "s%d ang%d -> %d us (lo%d hi%d)", servo, angle, us, lo, hi);
-    servo_write_us(servo, us);
-}
-
 // Move to one end: hold Up/Down to move, press Cal to confirm this spot.
-static int nudge_to_end(int servo, const char *name, const char *which) {
+static int nudge_to_end(Servo &servo, const char *name, const char *which) {
     int us = 1500;
-    servo_write_us(servo, us);
+    servo.writeUS(us);
     ESP_LOGI(TAG, "%s servo - %s end: hold Up/Down to move, press Calibrate to confirm", name, which);
 
     // Wait for the calibrate button to be released first, so the press that
@@ -120,12 +66,12 @@ static int nudge_to_end(int servo, const char *name, const char *which) {
     while (1) {
         if (pressed(BTN_CAL)) break;            // confirm setting
         if (pressed(BTN_UP))   {
-            us = clamp(us + US_PER_STEP, RAW_MIN_US, RAW_MAX_US);
+            us = std::clamp(us + US_PER_STEP, RAW_MIN_US, RAW_MAX_US);
         }
         if (pressed(BTN_DOWN)) {
-            us = clamp(us - US_PER_STEP, RAW_MIN_US, RAW_MAX_US);
+            us = std::clamp(us - US_PER_STEP, RAW_MIN_US, RAW_MAX_US);
         }
-        servo_write_us(servo, us);
+        servo.writeUS(us);
         //ESP_LOGI(TAG, "  %s %s: %d us   \r", name, which, us);
         fflush(stdout);
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -138,7 +84,7 @@ static int nudge_to_end(int servo, const char *name, const char *which) {
     return us;
 }
 
-static void calibrate_servo(int servo, const char *name, int *out_min, int *out_max) {
+static void calibrate_servo(Servo &servo, const char *name, int *out_min, int *out_max) {
     ESP_LOGI(TAG, "=== Calibrating %s servo (remove horn if it may jam) ===", name);
     int hi = nudge_to_end(servo, name, "HIGH");
     int lo = nudge_to_end(servo, name, "LOW");
@@ -147,14 +93,14 @@ static void calibrate_servo(int servo, const char *name, int *out_min, int *out_
     *out_min = lo + MARGIN_US;
     if (*out_min > *out_max) { int t = *out_min; *out_min = *out_max; *out_max = t; }
 
-    servo_write_us(servo, 1500);
+    servo.writeUS(1500);
     ESP_LOGI(TAG, "%s done: min %d us, max %d us", name, *out_min, *out_max);
 }
 
-static void run_calibration(void) {
+static void run_calibration(Servo &pan, Servo &tilt) {
     int pan_min, pan_max, tilt_min, tilt_max;
-    calibrate_servo(TILT_SERVO, "tilt", &tilt_min, &tilt_max);
-    calibrate_servo(PAN_SERVO,  "pan",  &pan_min,  &pan_max);
+    calibrate_servo(tilt, "tilt", &tilt_min, &tilt_max);
+    calibrate_servo(pan,  "pan",  &pan_min,  &pan_max);
 
     config.version = CONFIG_VERSION;
     config.min_us[PAN_SERVO]  = pan_min;  config.max_us[PAN_SERVO]  = pan_max;
@@ -166,38 +112,19 @@ static void run_calibration(void) {
 
 }
 
-static void scan_routine(void) {
-    // Start routine
-    ESP_LOGI(TAG, "Doing scan routine");
-    while (1) {
-        for (int angle = 0; angle <= 180; angle += STEP_DEG) {
-            servo_write_angle(PAN_SERVO, angle);
-            vTaskDelay(pdMS_TO_TICKS(UPDATE_MS/2));
-            servo_write_angle(TILT_SERVO, angle);
-            vTaskDelay(pdMS_TO_TICKS(UPDATE_MS/2));
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
-
-        for (int angle = 180; angle >= 0; angle -= STEP_DEG) {
-            for (int s = 0; s < NUM_SERVOS; ++s) {
-                servo_write_angle(PAN_SERVO, angle);
-                vTaskDelay(pdMS_TO_TICKS(UPDATE_MS/2));
-                servo_write_angle(TILT_SERVO, angle);
-                vTaskDelay(pdMS_TO_TICKS(UPDATE_MS/2));
-            }
-
-        }
-        vTaskDelay(pdMS_TO_TICKS(500));
-    }
+static void tracker_task(void *arg) {
+    static_cast<Tracker *>(arg)->run();
 }
 
-void app_main(void) {
+extern "C" void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(2000));   // give the USB monitor time to reconnect
     ESP_LOGI(TAG, "Program start");
 
     init_storage();
     ESP_LOGI(TAG, "Flash storage initialized");
-    servo_init();
+    // Static so they outlive app_main; the motion and tracker tasks use them forever
+    static Servo pan(static_cast<gpio_num_t>(SERVO_PINS[PAN_SERVO]));
+    static Servo tilt(static_cast<gpio_num_t>(SERVO_PINS[TILT_SERVO]));
     ESP_LOGI(TAG, "Servos initialized");
     buttons_init();
     ESP_LOGI(TAG, "Buttons initialized");
@@ -219,19 +146,25 @@ void app_main(void) {
     // Calibrate if the button is held at startup
     if (want_cal) {
         ESP_LOGI(TAG, "Calibrate button held - entering calibration");
-        run_calibration();
+        run_calibration(pan, tilt);
     } else {
         ESP_LOGI(TAG, "Skipping calibration - hold Calibrate at reset to run it");
     }
 
+    pan.setRange(config.min_us[PAN_SERVO], config.max_us[PAN_SERVO]);
+    tilt.setRange(config.min_us[TILT_SERVO], config.max_us[TILT_SERVO]);
 
-    // Move all servos to the center
-    for (int i=0; i<NUM_SERVOS; ++i) {
-        servo_write_angle(i, 90);
-    }
+    // Move all servos to the center and start smooth motion control
+    static PanTilt mount(pan, tilt,
+                         Range{config.pan_min, config.pan_max},
+                         Range{config.tilt_min, config.tilt_max});
+    mount.start(mount.panRange().center(), mount.tiltRange().center());
     vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_LOGI(TAG, "Reset Motors to center");
 
-    scan_routine();
-    
+    Camera::init();
+    static FaceDetector detector;
+    static Tracker tracker(mount, detector);
+
+    xTaskCreatePinnedToCore(tracker_task, "tracker", TRACKER_STACK, &tracker, TRACKER_PRIO, nullptr, 1);
 }
