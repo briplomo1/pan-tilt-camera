@@ -5,11 +5,17 @@ The experiment design is in [EXPERIMENT_PLAN.md](EXPERIMENT_PLAN.md).
 
 ## One-time setup
 
-Firmware: PlatformIO (as before). Host tools: Python 3.10+ with
+Firmware: PlatformIO (as before). Host tools: Python 3.10+ in a virtual env at `.venv`:
 
 ```
+python -m venv .venv
+.venv\Scripts\activate          # Git Bash: source .venv/Scripts/activate
 pip install -r tools/requirements.txt
 ```
+
+Activate it in each new terminal before running the tools (or call `.venv\Scripts\python` directly).
+The training notebooks (Phase 3 onwards) get their own env, `.venv-train`, so their heavier
+dependencies don't touch the live tools.
 
 The serial port is read from `monitor_port` in `platformio.ini` (currently COM9). Override it
 with `--port COMx` on any tool, or set `PAN_TILT_PORT`.
