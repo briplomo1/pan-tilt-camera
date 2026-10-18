@@ -17,12 +17,12 @@ class Servo {
 
     public:
 
-    explicit Servo(gpio_num_t pin) : pin_(pin) {}
+    explicit Servo(gpio_num_t pin);
     ~Servo();
     Servo(const Servo &) = delete;
     Servo &operator=(const Servo &) = delete;
     Servo(Servo &&) = delete;
-    Servo &operator(Servo &&) = delete;
+    Servo &operator=(Servo &&) = delete;
 
     void setRange(int min_ud, int max_us);
     void writeUS(int us) const;
