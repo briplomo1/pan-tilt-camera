@@ -160,8 +160,9 @@ extern "C" void app_main(void) {
     // Move all servos to the center and start smooth motion control
     static PanTilt mount(pan, tilt,
                          Range{config.pan_min, config.pan_max},
-                         Range{config.tilt_min, config.tilt_max});
-    mount.start(mount.panRange().center(), mount.tiltRange().center());
+                         Range{config.tilt_min, config.tilt_max},
+                         TILT_LEVEL_DEG);
+    mount.start(mount.panRange().center(), mount.tiltLevel());
     vTaskDelay(pdMS_TO_TICKS(1000));
     ESP_LOGI(TAG, "Reset Motors to center");
 

@@ -25,6 +25,7 @@ private:
     Servo &tilt_;
     Range panRange_;
     Range tiltRange_;
+    float tiltLevel_;
 
     mutable portMUX_TYPE lock_ = portMUX_INITIALIZER_UNLOCKED;
     float panPos_ = 90.0f;
@@ -37,8 +38,8 @@ private:
     [[noreturn]] void run();
 
 public:
-    PanTilt(Servo &pan, Servo &tilt, Range panRange, Range tiltRange)
-        : pan_(pan), tilt_(tilt), panRange_(panRange), tiltRange_(tiltRange) {}
+    PanTilt(Servo &pan, Servo &tilt, Range panRange, Range tiltRange, float tiltLevel)
+        : pan_(pan), tilt_(tilt), panRange_(panRange), tiltRange_(tiltRange), tiltLevel_(tiltRange.clamp(tiltLevel)) {}
 
     PanTilt(const PanTilt &) = delete;
     PanTilt &operator=(const PanTilt &) = delete;
@@ -57,4 +58,6 @@ public:
 
     [[nodiscard]] const Range &panRange() const { return panRange_; }
     [[nodiscard]] const Range &tiltRange() const { return tiltRange_; }
+    // Tilt angle where the camera faces the horizon
+    [[nodiscard]] float tiltLevel() const { return tiltLevel_; }
 };

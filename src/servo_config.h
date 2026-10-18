@@ -10,6 +10,9 @@ static const int SERVO_PINS[] = {1, 2};
 #define PAN_SERVO      0
 #define TILT_SERVO     1
 
+// Tilt angle where the camera faces roughly level; the scan rows and start position centre on it
+#define TILT_LEVEL_DEG 150.0f
+
 #define CONFIG_VERSION 1
 
 // Everything we want to persist. Bump 'version' if you change the fields.

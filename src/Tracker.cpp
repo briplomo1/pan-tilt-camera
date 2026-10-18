@@ -35,7 +35,7 @@ constexpr float kDeadband = 0.06f;
 constexpr float kScanSpeedDegS = 30.0f;    // slow enough that frames aren't blurred
 constexpr float kTrackSpeedDegS = 240.0f;
 
-// Tilt rows the scan visits, as offsets from the tilt range center
+// Tilt rows the scan visits, as offsets from the calibrated level tilt
 constexpr std::array<float, 3> kScanRowOffsets = {0.0f, -20.0f, 20.0f};
 
 constexpr int64_t kLostTimeoutUs = 1500 * 1000;
@@ -170,7 +170,7 @@ void Tracker::scanStep() {
 
 float Tracker::scanRowTilt() const {
     const Range &tilt = mount_.tiltRange();
-    return tilt.clamp(tilt.center() + kScanRowOffsets[scanRow_]);
+    return tilt.clamp(mount_.tiltLevel() + kScanRowOffsets[scanRow_]);
 }
 
 void Tracker::steerToward(const Face &face, int frameW, int frameH, float panAtCapture, float tiltAtCapture) {
