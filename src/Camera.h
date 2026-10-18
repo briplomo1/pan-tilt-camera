@@ -2,6 +2,7 @@
 
 #include <utility>
 #include "esp_camera.h"
+#include "vision/ImageView.h"
 
 // One captured frame. Hands the buffer back to the driver when it goes out of scope.
 class Frame {
@@ -20,6 +21,14 @@ public:
     explicit operator bool() const { return fb_ != nullptr; }
     const camera_fb_t &operator*() const { return *fb_; }
     const camera_fb_t *operator->() const { return fb_; }
+
+    // The pixels as an image any detector can take; empty unless the frame is RGB565.
+    // Only valid while this Frame is alive.
+    [[nodiscard]] ImageView view() const {
+        if (!fb_ || fb_->format != PIXFORMAT_RGB565) return {};
+        return ImageView{fb_->buf, static_cast<uint16_t>(fb_->width), static_cast<uint16_t>(fb_->height),
+                         PixelFormat::Rgb565Be};
+    }
 };
 
 /**

@@ -1,41 +1,96 @@
 #pragma once
 
+#include <cstdint>
 #include <optional>
-#include <vector>
-#include "FaceDetector.h"
+#include <span>
 #include "PanTilt.h"
+#include "vision/IDetector.h"
+
+enum class TrackState : uint8_t { Scan = 0, Track = 1, Paused = 2 };
+
+// What happened in one tracker step, for telemetry and the live view
+struct TrackSample {
+    uint32_t frameId = 0;
+    int64_t captureUs = 0;
+    TrackState state = TrackState::Scan;
+    float pan = 0.0f;                // mount angles when the frame was captured
+    float tilt = 0.0f;
+    float panTarget = 0.0f;          // target set this step
+    float tiltTarget = 0.0f;
+    std::span<const Face> faces;
+    int targetIndex = -1;            // face being followed, -1 for none
+    DetectTiming timing;
+    ImageView image;                 // camera pixels; only valid during the callback
+};
+
+class ITrackObserver {
+
+public:
+    virtual ~ITrackObserver() = default;
+    ITrackObserver(const ITrackObserver &) = delete;
+    ITrackObserver &operator=(const ITrackObserver &) = delete;
+    ITrackObserver(ITrackObserver &&) = delete;
+    ITrackObserver &operator=(ITrackObserver &&) = delete;
+
+    // Called once per frame while the camera buffer is still held
+    virtual void onTrackFrame(const TrackSample &sample) = 0;
+
+protected:
+    ITrackObserver() = default;
+};
 
 /**
- * Scan / track loop.
+ * Scan / track logic, one camera frame per step().
  *
- *  SCAN:  sweep pan back and forth, stepping tilt to a new row at each end,
- *         running face detection on every frame.
- *  TRACK: steer so the face sits in the middle of the frame. If no face is seen
- *         for kLostTimeoutMs, go back to SCAN from wherever the mount is.
+ *  SCAN:   sweep pan back and forth, stepping tilt to a new row at each end,
+ *          running face detection on every frame.
+ *  TRACK:  steer so the face sits in the middle of the frame. If no face is seen
+ *          for kLostTimeoutUs, go back to SCAN from wherever the mount is.
+ *  PAUSED: mount held still (benchmark mode); step() does nothing.
  */
 class Tracker {
 
 private:
-    enum class State { Scan, Track };
-
     PanTilt &mount_;
-    FaceDetector &detector_;
+    ITrackObserver *observer_ = nullptr;
 
-    State state_ = State::Scan;
+    TrackState state_ = TrackState::Scan;
     int scanDir_ = 1;              // +1 sweeping toward pan max, -1 toward pan min
     size_t scanRow_ = 0;
     int64_t lastSeenUs_ = 0;
     std::optional<Face> lastFace_;
+    float panTarget_ = 0.0f;
+    float tiltTarget_ = 0.0f;
+
+    uint32_t frameId_ = 0;
+    int64_t lastStatsUs_ = 0;
+    int frames_ = 0;
 
     void enterScan();
     void enterTrack();
     void scanStep();
     void steerToward(const Face &face, int frameW, int frameH, float panAtCapture, float tiltAtCapture);
-    [[nodiscard]] std::optional<Face> pickFace(const std::vector<Face> &faces) const;
+    [[nodiscard]] int pickFace(std::span<const Face> faces) const;
     [[nodiscard]] float scanRowTilt() const;
+    void logStats(int64_t now);
 
 public:
-    Tracker(PanTilt &mount, FaceDetector &detector) : mount_(mount), detector_(detector) {}
+    explicit Tracker(PanTilt &mount) : mount_(mount) {}
+    Tracker(const Tracker &) = delete;
+    Tracker &operator=(const Tracker &) = delete;
+    Tracker(Tracker &&) = delete;
+    Tracker &operator=(Tracker &&) = delete;
 
-    [[noreturn]] void run();
+    void setObserver(ITrackObserver *observer) { observer_ = observer; }
+
+    // Capture one frame, find faces with `detector` and steer. Call repeatedly.
+    void step(IDetector &detector);
+
+    // Hold the mount where it is until resume()
+    void pause();
+
+    // Start scanning again from the current position
+    void resume();
+
+    [[nodiscard]] TrackState state() const { return state_; }
 };

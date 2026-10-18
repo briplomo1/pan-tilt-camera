@@ -3,3 +3,12 @@
 .vscode/c_cpp_properties.json
 .vscode/launch.json
 .vscode/ipch
+
+# Host tools
+__pycache__/
+.venv/
+build/
+results/
+recordings/
+data/
+.ipynb_checkpoints/

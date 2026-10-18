@@ -28,7 +28,8 @@ constexpr float kTiltDir = 1.0f;
 // since each frame is already ~50-80 ms old by the time it's processed.
 constexpr float kGain = 0.6f;
 
-// Ignore errors smaller than this fraction of half the frame (stops jitter)
+// Ignore errors smaller than this fraction of half the frame (stops jitter).
+// tools/view/live_view.py draws the same box; update it there too.
 constexpr float kDeadband = 0.06f;
 
 constexpr float kScanSpeedDegS = 30.0f;    // slow enough that frames aren't blurred
@@ -46,64 +47,101 @@ float applyDeadband(float err) {
 }
 } // namespace
 
-void Tracker::run() {
+void Tracker::step(IDetector &detector) {
+    if (state_ == TrackState::Paused) return;
+    if (lastStatsUs_ == 0) {
+        // First frame: start scanning from wherever the mount is
+        enterScan();
+        lastStatsUs_ = esp_timer_get_time();
+    }
+
+    Frame frame = Camera::capture();
+    ImageView image = frame.view();
+    if (!image) {
+        ESP_LOGW(TAG, "Camera capture failed");
+        delay(100ms);
+        return;
+    }
+    // Where the mount was pointing when this frame was taken
+    int64_t captureUs = esp_timer_get_time();
+    float panAtCapture = mount_.pan();
+    float tiltAtCapture = mount_.tilt();
+
+    DetectTiming timing;
+    std::span<const Face> faces = detector.detect(image, timing);
+
+    int64_t now = esp_timer_get_time();
+    int target = pickFace(faces);
+
+    if (target >= 0) {
+        const Face &face = faces[target];
+        if (state_ == TrackState::Scan) {
+            ESP_LOGI(TAG, "Face found (score %.2f) at pan %.1f tilt %.1f - tracking",
+                     face.score, panAtCapture, tiltAtCapture);
+            enterTrack();
+        }
+        lastSeenUs_ = now;
+        lastFace_ = face;
+        steerToward(face, image.width, image.height, panAtCapture, tiltAtCapture);
+    } else if (state_ == TrackState::Track && now - lastSeenUs_ > kLostTimeoutUs) {
+        ESP_LOGI(TAG, "Face lost - scanning");
+        enterScan();
+    }
+    // While tracking with no face this frame: hold position until the timeout
+
+    if (state_ == TrackState::Scan) {
+        scanStep();
+    }
+
+    if (observer_) {
+        observer_->onTrackFrame(TrackSample{
+            .frameId = frameId_,
+            .captureUs = captureUs,
+            .state = state_,
+            .pan = panAtCapture,
+            .tilt = tiltAtCapture,
+            .panTarget = panTarget_,
+            .tiltTarget = tiltTarget_,
+            .faces = faces,
+            .targetIndex = target,
+            .timing = timing,
+            .image = image,
+        });
+    }
+    ++frameId_;
+    logStats(now);
+}   // frame buffer goes back to the driver here
+
+void Tracker::pause() {
+    if (state_ == TrackState::Paused) return;
+    state_ = TrackState::Paused;
+    lastFace_.reset();
+    panTarget_ = mount_.pan();
+    tiltTarget_ = mount_.tilt();
+    mount_.setTarget(panTarget_, tiltTarget_);
+    ESP_LOGI(TAG, "Paused at pan %.1f tilt %.1f", panTarget_, tiltTarget_);
+}
+
+void Tracker::resume() {
+    if (state_ != TrackState::Paused) return;
+    ESP_LOGI(TAG, "Resumed - scanning");
     enterScan();
-    int64_t lastStatsUs = esp_timer_get_time();
-    int frames = 0;
+    lastStatsUs_ = esp_timer_get_time();
+    frames_ = 0;
+}
 
-    while (true) {
-        float panAtCapture, tiltAtCapture;
-        int frameW, frameH;
-        std::vector<Face> faces;
-        {
-            Frame frame = Camera::capture();
-            if (!frame) {
-                ESP_LOGW(TAG, "Camera capture failed");
-                delay(100ms);
-                continue;
-            }
-            // Where the mount was pointing when this frame was taken
-            panAtCapture = mount_.pan();
-            tiltAtCapture = mount_.tilt();
-            frameW = frame->width;
-            frameH = frame->height;
-            faces = detector_.detect(*frame);
-        } // frame buffer goes back to the driver here
-
-        int64_t now = esp_timer_get_time();
-        std::optional<Face> face = pickFace(faces);
-
-        if (face) {
-            if (state_ == State::Scan) {
-                ESP_LOGI(TAG, "Face found (score %.2f) at pan %.1f tilt %.1f - tracking",
-                         face->score, panAtCapture, tiltAtCapture);
-                enterTrack();
-            }
-            lastSeenUs_ = now;
-            lastFace_ = face;
-            steerToward(*face, frameW, frameH, panAtCapture, tiltAtCapture);
-        } else if (state_ == State::Track && now - lastSeenUs_ > kLostTimeoutUs) {
-            ESP_LOGI(TAG, "Face lost - scanning");
-            enterScan();
-        }
-        // While tracking with no face this frame: hold position until the timeout
-
-        if (state_ == State::Scan) {
-            scanStep();
-        }
-
-        ++frames;
-        if (now - lastStatsUs >= 5000 * 1000) {
-            ESP_LOGI(TAG, "%s, %.1f fps", state_ == State::Scan ? "scanning" : "tracking",
-                     frames * 1e6f / (now - lastStatsUs));
-            frames = 0;
-            lastStatsUs = now;
-        }
+void Tracker::logStats(int64_t now) {
+    ++frames_;
+    if (now - lastStatsUs_ >= 5000 * 1000) {
+        ESP_LOGI(TAG, "%s, %.1f fps", state_ == TrackState::Scan ? "scanning" : "tracking",
+                 frames_ * 1e6f / (now - lastStatsUs_));
+        frames_ = 0;
+        lastStatsUs_ = now;
     }
 }
 
 void Tracker::enterScan() {
-    state_ = State::Scan;
+    state_ = TrackState::Scan;
     lastFace_.reset();
     mount_.setMaxSpeed(kScanSpeedDegS);
     // Carry on in whichever direction has more room
@@ -111,7 +149,7 @@ void Tracker::enterScan() {
 }
 
 void Tracker::enterTrack() {
-    state_ = State::Track;
+    state_ = TrackState::Track;
     mount_.setMaxSpeed(kTrackSpeedDegS);
 }
 
@@ -125,7 +163,9 @@ void Tracker::scanStep() {
         scanRow_ = (scanRow_ + 1) % kScanRowOffsets.size();
         end = scanDir_ > 0 ? pan.max : pan.min;
     }
-    mount_.setTarget(end, scanRowTilt());
+    panTarget_ = end;
+    tiltTarget_ = scanRowTilt();
+    mount_.setTarget(panTarget_, tiltTarget_);
 }
 
 float Tracker::scanRowTilt() const {
@@ -140,28 +180,32 @@ void Tracker::steerToward(const Face &face, int frameW, int frameH, float panAtC
 
     float pan = panAtCapture + kPanDir * kGain * errX * (kHFovDeg / 2.0f);
     float tilt = tiltAtCapture + kTiltDir * kGain * errY * (kVFovDeg / 2.0f);
-    mount_.setTarget(pan, tilt);
+    // Record what the mount will actually aim for
+    panTarget_ = mount_.panRange().clamp(pan);
+    tiltTarget_ = mount_.tiltRange().clamp(tilt);
+    mount_.setTarget(panTarget_, tiltTarget_);
 
     ESP_LOGD(TAG, "face (%.0f,%.0f) err (%.2f,%.2f) -> pan %.1f tilt %.1f",
              face.cx, face.cy, errX, errY, pan, tilt);
 }
 
-std::optional<Face> Tracker::pickFace(const std::vector<Face> &faces) const {
-    if (faces.empty()) return std::nullopt;
+int Tracker::pickFace(std::span<const Face> faces) const {
+    if (faces.empty()) return -1;
 
-    const Face *best = &faces.front();
-    for (const Face &f : faces) {
+    size_t best = 0;
+    for (size_t i = 1; i < faces.size(); ++i) {
+        const Face &f = faces[i];
         if (lastFace_) {
             // Already following someone: stick with whoever is closest to them
             auto dist = [&](const Face &a) {
                 float dx = a.cx - lastFace_->cx, dy = a.cy - lastFace_->cy;
                 return dx * dx + dy * dy;
             };
-            if (dist(f) < dist(*best)) best = &f;
-        } else if (f.width * f.height > best->width * best->height) {
+            if (dist(f) < dist(faces[best])) best = i;
+        } else if (f.width * f.height > faces[best].width * faces[best].height) {
             // New target: take the biggest (closest) face
-            best = &f;
+            best = i;
         }
     }
-    return *best;
+    return static_cast<int>(best);
 }

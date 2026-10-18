@@ -5,11 +5,18 @@
 #include "driver/gpio.h"
 #include <stdio.h>
 #include <algorithm>
+#include "Storage.h"
 #include "Servo.h"
 #include "PanTilt.h"
 #include "Camera.h"
-#include "FaceDetector.h"
-#include "Tracker.h"
+#include "app/BenchService.h"
+#include "app/DetectorSlot.h"
+#include "app/PreviewStreamer.h"
+#include "app/VisionLoop.h"
+#include "link/Link.h"
+#include "link/UsbSerialTransport.h"
+#include "models/ModelStore.h"
+#include "vision/DetectorRegistry.h"
 
 #define TAG "servos"
 
@@ -25,9 +32,8 @@
 // Buttons settings
 #define US_PER_STEP     6
 
-// Tracker runs on core 1 so detection never competes with the servo task on core 0
-#define TRACKER_STACK   16384
-#define TRACKER_PRIO    3
+// Model loaded at boot: the ESP-DL baseline (B0 in docs/EXPERIMENT_PLAN.md)
+#define DEFAULT_MODEL   "espdl-msrmnp-s8"
 
 static servo_config config;
 
@@ -107,22 +113,16 @@ static void run_calibration(Servo &pan, Servo &tilt) {
     config.min_us[TILT_SERVO] = tilt_min; config.max_us[TILT_SERVO] = tilt_max;
 
     // Save new servos config
-    bool ok = save_config(&config);
-    ESP_LOGI(TAG, "Calibration %s: pan %d..%d, tilt %d..%d", ok ? "saved" : "SAVE FAILED", pan_min, pan_max, tilt_min, tilt_max);
+    Storage::save(CONFIG_KEY, config);
+    ESP_LOGI(TAG, "Calibration saved: pan %d..%d, tilt %d..%d", pan_min, pan_max, tilt_min, tilt_max);
 
-}
-
-static void tracker_task(void *arg) {
-    static_cast<Tracker *>(arg)->run();
 }
 
 extern "C" void app_main(void) {
     vTaskDelay(pdMS_TO_TICKS(2000));   // give the USB monitor time to reconnect
     ESP_LOGI(TAG, "Program start");
 
-    init_storage();
-    ESP_LOGI(TAG, "Flash storage initialized");
-    // Static so they outlive app_main; the motion and tracker tasks use them forever
+    // Static so they outlive app_main; the motion and vision tasks use them forever
     static Servo pan(static_cast<gpio_num_t>(SERVO_PINS[PAN_SERVO]));
     static Servo tilt(static_cast<gpio_num_t>(SERVO_PINS[TILT_SERVO]));
     ESP_LOGI(TAG, "Servos initialized");
@@ -137,9 +137,12 @@ extern "C" void app_main(void) {
     }
 
     // Load saved calibration (or defaults if none)
-    if (load_config(&config)) {
+    auto saved = Storage::load<servo_config>(CONFIG_KEY);
+    if (saved && saved->version == CONFIG_VERSION) {
+        config = *saved;
         ESP_LOGI(TAG, "Loaded saved calibration");
     } else {
+        config = DEFAULTS;
         ESP_LOGW(TAG, "No saved calibration - using defaults until you calibrate");
     }
 
@@ -163,8 +166,19 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "Reset Motors to center");
 
     Camera::init();
-    static FaceDetector detector;
-    static Tracker tracker(mount, detector);
 
-    xTaskCreatePinnedToCore(tracker_task, "tracker", TRACKER_STACK, &tracker, TRACKER_PRIO, nullptr, 1);
+    // From here on the USB port carries framed packets, so plain serial monitors show garbage:
+    // use tools/link/monitor.py or tools/view/live_view.py (see docs/USAGE.md)
+    ESP_LOGI(TAG, "Starting USB link - logs continue as packets (python tools/link/monitor.py)");
+    static UsbSerialTransport transport;
+    static Link link(transport);
+    link.captureLogs();
+
+    static ModelStore store("model");
+    static DetectorRegistry registry(store);
+    static DetectorSlot detector(registry);
+    static PreviewStreamer preview(link);
+    static BenchService bench(link, detector, registry, store, preview, mount);
+    static VisionLoop vision(mount, link, detector, bench, preview);
+    vision.start(DEFAULT_MODEL);
 }

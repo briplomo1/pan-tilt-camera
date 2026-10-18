@@ -49,6 +49,7 @@ Storage::~Storage() {
 }
 
 bool Storage::loadRaw(const std::string &key, void *out, size_t len) {
+    (void)instance();   // lazily init NVS on first use
     NvsHandle handle(NVS_READONLY);
     if (handle.status() == ESP_ERR_NVS_NOT_FOUND) return false; // Not found
     ESP_ERROR_CHECK(handle.status());
@@ -69,6 +70,7 @@ bool Storage::loadRaw(const std::string &key, void *out, size_t len) {
 }
 
 void Storage::saveRaw(const std::string &key, const void *out, size_t len) {
+    (void)instance();
     NvsHandle handle(NVS_READWRITE);
     ESP_ERROR_CHECK(handle.status());
     ESP_ERROR_CHECK(nvs_set_blob(handle.get(), key.c_str(), out, len));
@@ -76,6 +78,7 @@ void Storage::saveRaw(const std::string &key, const void *out, size_t len) {
 }
 
 void Storage::erase(const std::string &key) {
+    (void)instance();
     NvsHandle handle(NVS_READWRITE);
     ESP_ERROR_CHECK(handle.status());
     esp_err_t err = nvs_erase_key(handle.get(), key.c_str());
@@ -85,6 +88,7 @@ void Storage::erase(const std::string &key) {
 }
 
 Partition Storage::getPartition(const std::string &label) {
+    (void)instance();
     const esp_partition_t *part = esp_partition_find_first(
         ESP_PARTITION_TYPE_DATA, ESP_PARTITION_SUBTYPE_ANY, label.c_str());
  
@@ -110,19 +114,26 @@ void Partition::read(size_t offset, std::span<uint8_t> out) const {
 }
  
 /**
- * It makes the partition's flash contents look like ordinary 
- * read-only memory, and hands you a std::span covering the whole partition
+ * It makes the partition's flash contents look like ordinary
+ * read-only memory, and hands back a region that unmaps itself when destroyed
  */
-std::span<const uint8_t> Partition::map() {
-    if (mapped_.empty()) {
-        const void *ptr = nullptr;
-        esp_partition_mmap_handle_t handle;
-        ESP_ERROR_CHECK(esp_partition_mmap(part_, 0, part_->size,
-                                           ESP_PARTITION_MMAP_DATA, &ptr, &handle));
-        mapped_ = std::span<const uint8_t>(static_cast<const uint8_t *>(ptr),
-                                   static_cast<size_t>(part_->size));
+MappedRegion Partition::map(size_t offset, size_t size) const {
+    if (size == 0 || offset > part_->size || size > part_->size - offset) {
+        ESP_LOGE(TAG, "Can't map %zu bytes at %zu in partition %s of size %zu bytes",
+                 size, offset, part_->label, static_cast<size_t>(part_->size));
+        ESP_ERROR_CHECK(ESP_ERR_INVALID_SIZE);
     }
-    return mapped_;
+    const void *ptr = nullptr;
+    esp_partition_mmap_handle_t handle;
+    ESP_ERROR_CHECK(esp_partition_mmap(part_, offset, size, ESP_PARTITION_MMAP_DATA, &ptr, &handle));
+    return MappedRegion(handle, std::span<const uint8_t>(static_cast<const uint8_t *>(ptr), size));
+}
+
+void MappedRegion::reset() {
+    if (!data_.empty()) {
+        esp_partition_munmap(handle_);
+        data_ = {};
+    }
 }
 
 void Partition::replace(std::span<const uint8_t> data) const {
