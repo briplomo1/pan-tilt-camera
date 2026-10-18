@@ -2,20 +2,61 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <cstdint>
 #include <optional>
 #include <span>
+#include <string>
+#include <string_view>
+#include <type_traits>
+#include <utility>
 #include "esp_err.h"
 #include "nvs_flash.h"
 #include "esp_log.h"
-#include <string>
 #include "esp_partition.h"
+
+
+/**
+ * Part of a flash partition mapped into the address space, read through the cache like
+ * ordinary read-only memory. Unmapped when it goes out of scope.
+ */
+class MappedRegion {
+
+private:
+    esp_partition_mmap_handle_t handle_ = 0;
+    std::span<const uint8_t> data_;     // empty when nothing is mapped
+    friend class Partition;
+    MappedRegion(esp_partition_mmap_handle_t handle, std::span<const uint8_t> data)
+        : handle_(handle), data_(data) {}
+
+public:
+    MappedRegion() = default;
+    ~MappedRegion() { reset(); }
+
+    MappedRegion(const MappedRegion &) = delete;
+    MappedRegion &operator=(const MappedRegion &) = delete;
+    MappedRegion(MappedRegion &&other) noexcept
+        : handle_(std::exchange(other.handle_, 0)), data_(std::exchange(other.data_, {})) {}
+    MappedRegion &operator=(MappedRegion &&other) noexcept {
+        if (this != &other) {
+            reset();
+            handle_ = std::exchange(other.handle_, 0);
+            data_ = std::exchange(other.data_, {});
+        }
+        return *this;
+    }
+
+    // Unmap now instead of at destruction
+    void reset();
+
+    [[nodiscard]] std::span<const uint8_t> data() const { return data_; }
+    explicit operator bool() const { return !data_.empty(); }
+};
 
 
 class Partition {
 
 private:
     const esp_partition_t *part_; // Non owning
-    std::span<const uint8_t> mapped_;
     friend class Storage;
     explicit Partition(const esp_partition_t *part) : part_(part) {}
 
@@ -26,7 +67,11 @@ public:
 
     void read(size_t offset, std::span<uint8_t> out) const;
 
-    [[nodiscard]] std::span<const uint8_t> map();
+    // Map [offset, offset + size) into memory. Stops if the range is outside the partition.
+    [[nodiscard]] MappedRegion map(size_t offset, size_t size) const;
+
+    // Map the whole partition
+    [[nodiscard]] MappedRegion map() const { return map(0, size()); }
 
     void replace(std::span<const uint8_t> data) const;
 };
@@ -35,8 +80,6 @@ public:
 class Storage {
 
 private:
-
-    static void init();
 
     [[nodiscard]] static bool loadRaw(const std::string &key, void *out, size_t len);
 
@@ -48,6 +91,7 @@ private:
 
 public:
 
+    // NVS is initialized on first use; every static call below goes through here
     [[nodiscard]] static Storage& instance();
 
     Storage(const Storage &) = delete;

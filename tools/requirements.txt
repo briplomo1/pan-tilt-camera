@@ -1,0 +1,10 @@
+# Host tools (live view, benchmark, capture, model packing)
+pyserial>=3.5
+numpy>=1.24
+pillow>=10.0
+opencv-python>=4.8
+
+# Tests (optional; the tests also run with plain `python -m unittest`)
+pytest>=7.0
+
+# Training work in notebooks/ (Phase 3 onwards) has its own requirements, added then
