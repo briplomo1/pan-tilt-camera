@@ -26,7 +26,17 @@ constexpr float kVFovDeg = 41.0f;
 constexpr float kPanDir = -1.0f;   // reversed on our mount: +1 panned away from the face
 constexpr float kTiltDir = 1.0f;
 
-// Fraction of the measured error corrected per frame. <1 avoids overshoot,
+// Smooth the face position with a Kalman filter and aim where it will be, instead of steering
+// straight from each raw detection. false restores the plain proportional controller below.
+constexpr bool kFilterFace = true;
+constexpr float kFaceAccelNoise = 150.0f;   // deg/s^2: how sharply a head changes speed
+constexpr float kFaceMeasNoise = 0.6f;      // deg: detection jitter (~3-4 px at 320 wide)
+constexpr float kFaceGate = 4.0f;           // sigmas; further detections are treated as outliers
+constexpr int kMaxRejects = 3;              // this many outliers in a row means the face really moved
+// Aim this far past the frame's processing time: roughly how long the servos take to respond
+constexpr float kLeadS = 0.05f;
+
+// Without the filter: fraction of the measured error corrected per frame. <1 avoids overshoot,
 // since each frame is already ~50-80 ms old by the time it's processed.
 constexpr float kGain = 0.6f;
 
@@ -55,6 +65,11 @@ float applyDeadband(float err) {
     return std::fabs(err) < kDeadband ? 0.0f : err;
 }
 } // namespace
+
+Tracker::Tracker(PanTilt &mount)
+    : mount_(mount),
+      panFilter_(kFaceAccelNoise, kFaceMeasNoise, kFaceGate),
+      tiltFilter_(kFaceAccelNoise, kFaceMeasNoise, kFaceGate) {}
 
 void Tracker::step(IDetector &detector) {
     if (state_ == TrackState::Paused) return;
@@ -91,7 +106,7 @@ void Tracker::step(IDetector &detector) {
         }
         lastSeenUs_ = now;
         lastFace_ = face;
-        steerToward(face, image.width, image.height, panAtCapture, tiltAtCapture);
+        steerToward(face, image.width, image.height, panAtCapture, tiltAtCapture, captureUs, now);
     } else if (state_ == TrackState::Track && now - lastSeenUs_ > kLostTimeoutUs) {
         ESP_LOGI(TAG, "Face lost - scanning");
         enterScan();
@@ -152,6 +167,8 @@ void Tracker::logStats(int64_t now) {
 void Tracker::enterScan() {
     state_ = TrackState::Scan;
     lastFace_.reset();
+    panFilter_.reset();
+    tiltFilter_.reset();
     mount_.setMaxSpeed(kScanMoveSpeedDegS);
     // Carry on in whichever direction has more room, looking first where the mount already is
     scanDir_ = mount_.pan() < mount_.panRange().center() ? 1 : -1;
@@ -194,13 +211,32 @@ float Tracker::scanRowTilt() const {
     return tilt.clamp(mount_.tiltLevel() + kScanRowOffsets[scanRow_]);
 }
 
-void Tracker::steerToward(const Face &face, int frameW, int frameH, float panAtCapture, float tiltAtCapture) {
+void Tracker::steerToward(const Face &face, int frameW, int frameH, float panAtCapture, float tiltAtCapture,
+                          int64_t captureUs, int64_t now) {
     // Offset of the face from the frame center, -1..1 on each axis
-    float errX = applyDeadband((face.cx - frameW / 2.0f) / (frameW / 2.0f));
-    float errY = applyDeadband((face.cy - frameH / 2.0f) / (frameH / 2.0f));
+    float rawX = (face.cx - frameW / 2.0f) / (frameW / 2.0f);
+    float rawY = (face.cy - frameH / 2.0f) / (frameH / 2.0f);
+    float errX = applyDeadband(rawX);
+    float errY = applyDeadband(rawY);
 
-    float pan = panAtCapture + kPanDir * kGain * errX * (kHFovDeg / 2.0f);
-    float tilt = tiltAtCapture + kTiltDir * kGain * errY * (kVFovDeg / 2.0f);
+    float pan;
+    float tilt;
+    if (kFilterFace) {
+        // Direction of the face in mount angles, from where the mount was when the frame was taken
+        float facePan = panAtCapture + kPanDir * rawX * (kHFovDeg / 2.0f);
+        float faceTilt = tiltAtCapture + kTiltDir * rawY * (kVFovDeg / 2.0f);
+        filterFace(facePan, faceTilt, captureUs);
+
+        // Aim where the face will be once the servos respond, unless it's already near the centre
+        float ahead = (now - captureUs) / 1e6f + kLeadS;
+        pan = std::fabs(panFilter_.angle() - panAtCapture) < kDeadband * (kHFovDeg / 2.0f)
+                  ? panAtCapture : panFilter_.predicted(ahead);
+        tilt = std::fabs(tiltFilter_.angle() - tiltAtCapture) < kDeadband * (kVFovDeg / 2.0f)
+                   ? tiltAtCapture : tiltFilter_.predicted(ahead);
+    } else {
+        pan = panAtCapture + kPanDir * kGain * errX * (kHFovDeg / 2.0f);
+        tilt = tiltAtCapture + kTiltDir * kGain * errY * (kVFovDeg / 2.0f);
+    }
     // Record what the mount will actually aim for
     panTarget_ = mount_.panRange().clamp(pan);
     tiltTarget_ = mount_.tiltRange().clamp(tilt);
@@ -208,6 +244,30 @@ void Tracker::steerToward(const Face &face, int frameW, int frameH, float panAtC
 
     ESP_LOGD(TAG, "face (%.0f,%.0f) err (%.2f,%.2f) -> pan %.1f tilt %.1f",
              face.cx, face.cy, errX, errY, pan, tilt);
+}
+
+void Tracker::filterFace(float facePan, float faceTilt, int64_t captureUs) {
+    if (!panFilter_.ready()) {
+        panFilter_.init(facePan);
+        tiltFilter_.init(faceTilt);
+        filterUs_ = captureUs;
+        rejects_ = 0;
+        return;
+    }
+    float dt = (captureUs - filterUs_) / 1e6f;
+    filterUs_ = captureUs;
+    panFilter_.predict(dt);
+    tiltFilter_.predict(dt);
+    bool panOk = panFilter_.update(facePan);
+    bool tiltOk = tiltFilter_.update(faceTilt);
+    if (panOk && tiltOk) {
+        rejects_ = 0;
+    } else if (++rejects_ >= kMaxRejects) {
+        // Consistently somewhere else: the face really jumped, so start again from here
+        panFilter_.init(facePan);
+        tiltFilter_.init(faceTilt);
+        rejects_ = 0;
+    }
 }
 
 int Tracker::pickFace(std::span<const Face> faces) const {

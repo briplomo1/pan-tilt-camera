@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include "FaceFilter.h"
 #include "PanTilt.h"
 #include "vision/IDetector.h"
 
@@ -64,6 +65,12 @@ private:
     float panTarget_ = 0.0f;
     float tiltTarget_ = 0.0f;
 
+    // Face direction in mount angles, smoothed and with velocity (see Tracker.cpp tuning)
+    AxisFilter panFilter_;
+    AxisFilter tiltFilter_;
+    int64_t filterUs_ = 0;         // capture time the filters were last updated for
+    int rejects_ = 0;              // outlier detections in a row
+
     uint32_t frameId_ = 0;
     int64_t lastStatsUs_ = 0;
     int frames_ = 0;
@@ -71,13 +78,15 @@ private:
     void enterScan();
     void enterTrack();
     void scanStep(int64_t now);
-    void steerToward(const Face &face, int frameW, int frameH, float panAtCapture, float tiltAtCapture);
+    void steerToward(const Face &face, int frameW, int frameH, float panAtCapture, float tiltAtCapture,
+                     int64_t captureUs, int64_t now);
+    void filterFace(float facePan, float faceTilt, int64_t captureUs);
     [[nodiscard]] int pickFace(std::span<const Face> faces) const;
     [[nodiscard]] float scanRowTilt() const;
     void logStats(int64_t now);
 
 public:
-    explicit Tracker(PanTilt &mount) : mount_(mount) {}
+    explicit Tracker(PanTilt &mount);
     Tracker(const Tracker &) = delete;
     Tracker &operator=(const Tracker &) = delete;
     Tracker(Tracker &&) = delete;
