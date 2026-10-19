@@ -57,6 +57,10 @@ void Camera::init() {
     ESP_ERROR_CHECK(esp_camera_init(&config));
 
     sensor_t *sensor = esp_camera_sensor_get();
+    if (sensor) {
+        // One step brighter than auto exposure: faces against a bright window came out too dark to detect
+        sensor->set_ae_level(sensor, 1);
+    }
     ESP_LOGI(TAG, "Camera ready, sensor PID 0x%02x", sensor ? sensor->id.PID : 0);
 }
 

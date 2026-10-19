@@ -12,6 +12,8 @@ namespace {
 constexpr const char *TAG = "tracker";
 
 // --- Tuning -----------------------------------------------------------------
+// Fixed for every model from the B0 baseline on (docs/EXPERIMENT_PLAN.md §8), so
+// models are compared under the same controller. Don't retune per model.
 
 // Camera field of view (OV2640 stock lens at 4:3). Used to turn a pixel offset
 // into degrees; only needs to be roughly right.
@@ -21,7 +23,7 @@ constexpr float kVFovDeg = 41.0f;
 // Flip to -1 if the mount moves away from the face instead of toward it.
 // +1 pan: face right of center -> pan angle increases.
 // +1 tilt: face below center -> tilt angle increases.
-constexpr float kPanDir = 1.0f;
+constexpr float kPanDir = -1.0f;   // reversed on our mount: +1 panned away from the face
 constexpr float kTiltDir = 1.0f;
 
 // Fraction of the measured error corrected per frame. <1 avoids overshoot,
@@ -32,13 +34,20 @@ constexpr float kGain = 0.6f;
 // tools/view/live_view.py draws the same box; update it there too.
 constexpr float kDeadband = 0.06f;
 
-constexpr float kScanSpeedDegS = 30.0f;    // slow enough that frames aren't blurred
-constexpr float kTrackSpeedDegS = 240.0f;
+constexpr float kTrackSpeedDegS = 90.0f;   // faster blurred the face and the detector missed it
+
+// Scan sweeps slowly and pauses every kScanStepDeg so the camera gets sharp frames: a
+// non-stop 30°/s sweep blurred faces past detection, and fast hops between stops were jerky.
+constexpr float kScanStepDeg = 20.0f;          // well under the 54° FOV, so neighbouring views overlap
+constexpr float kScanMoveSpeedDegS = 20.0f;
+constexpr int64_t kScanDwellUs = 500 * 1000;   // servo settles (~250 ms), then a few frames to detect on
 
 // Tilt rows the scan visits, as offsets from the calibrated level tilt
 constexpr std::array<float, 3> kScanRowOffsets = {0.0f, -20.0f, 20.0f};
 
-constexpr int64_t kLostTimeoutUs = 1500 * 1000;
+// Hold position this long without a detection before scanning again. The stock model
+// misses runs of frames (measured up to ~1.3 s) with the face still in view.
+constexpr int64_t kLostTimeoutUs = 3000 * 1000;
 
 // ----------------------------------------------------------------------------
 
@@ -90,7 +99,7 @@ void Tracker::step(IDetector &detector) {
     // While tracking with no face this frame: hold position until the timeout
 
     if (state_ == TrackState::Scan) {
-        scanStep();
+        scanStep(now);
     }
 
     if (observer_) {
@@ -143,9 +152,13 @@ void Tracker::logStats(int64_t now) {
 void Tracker::enterScan() {
     state_ = TrackState::Scan;
     lastFace_.reset();
-    mount_.setMaxSpeed(kScanSpeedDegS);
-    // Carry on in whichever direction has more room
+    mount_.setMaxSpeed(kScanMoveSpeedDegS);
+    // Carry on in whichever direction has more room, looking first where the mount already is
     scanDir_ = mount_.pan() < mount_.panRange().center() ? 1 : -1;
+    panTarget_ = mount_.pan();
+    tiltTarget_ = scanRowTilt();
+    scanArrivedUs_ = 0;
+    mount_.setTarget(panTarget_, tiltTarget_);
 }
 
 void Tracker::enterTrack() {
@@ -153,18 +166,26 @@ void Tracker::enterTrack() {
     mount_.setMaxSpeed(kTrackSpeedDegS);
 }
 
-void Tracker::scanStep() {
+void Tracker::scanStep(int64_t now) {
+    bool arrived = std::fabs(mount_.pan() - panTarget_) < 0.5f && std::fabs(mount_.tilt() - tiltTarget_) < 0.5f;
+    if (!arrived) {
+        scanArrivedUs_ = 0;
+        return;
+    }
+    if (scanArrivedUs_ == 0) scanArrivedUs_ = now;
+    if (now - scanArrivedUs_ < kScanDwellUs) return;   // still looking at this stop
+
     const Range &pan = mount_.panRange();
     float end = scanDir_ > 0 ? pan.max : pan.min;
-
-    if (std::fabs(mount_.pan() - end) < 0.5f) {
-        // Reached the end of this sweep: turn around and move to the next row
+    if (std::fabs(panTarget_ - end) < 0.5f) {
+        // Looked at the last stop of this sweep: turn around and move to the next row
         scanDir_ = -scanDir_;
         scanRow_ = (scanRow_ + 1) % kScanRowOffsets.size();
-        end = scanDir_ > 0 ? pan.max : pan.min;
+    } else {
+        panTarget_ = pan.clamp(panTarget_ + scanDir_ * kScanStepDeg);
     }
-    panTarget_ = end;
     tiltTarget_ = scanRowTilt();
+    scanArrivedUs_ = 0;
     mount_.setTarget(panTarget_, tiltTarget_);
 }
 

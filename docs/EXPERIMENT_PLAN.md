@@ -214,6 +214,37 @@ Every experiment fills one row of this table. Columns are grouped by category.
 5. The device streams TELEMETRY each frame: time, state, pan/tilt commanded, pan/tilt target, face box, score, detect µs.
 6. The host computes the closed-loop metrics in §7.
 7. Tracker gains (`kGain`, deadband, speeds) are held constant across models. A secondary run with gain re-tuned per model is reported separately, to show each model's best case.
+   Fixed settings, set before the B0 baseline was recorded:
+
+   | Setting | Value | Why |
+   |---|---|---|
+   | `kPanDir` / `kTiltDir` | −1 / +1 | Pan was reversed on this mount |
+   | `kGain` | 0.6 | Fraction of the measured error corrected per frame |
+   | `kDeadband` | 0.06 of half-frame | Stops jitter |
+   | `kTrackSpeedDegS` | 90 °/s | 240 °/s blurred the face and caused misses |
+   | Scan | slow sweep at 20 °/s with a 0.5 s pause every 20° of pan | A non-stop 30 °/s sweep blurred faces past detection; 90 °/s hops between pauses were jerky |
+   | `kLostTimeoutUs` | 3 s | B0 misses runs of frames (up to ~1.3 s) with the face in view |
+   | Scan tilt | level 150°, rows ±20° | Scan centred on the horizon, not the tilt-range middle |
+   | Camera exposure | `ae_level` +1 | Faces against a bright window were too dark |
+
+### 8.1 How tracking is compared across models: three tests
+
+A replayed video can't move the camera, so tracking is measured in three steps, each holding a different thing constant:
+
+| Test | Input | What moves | Measures | Removes |
+|---|---|---|---|---|
+| **Open loop** (§7 accuracy) | Labelled images and recorded videos, identical frames to every model (file on the Pi, USB on the ESP32) | Nothing; the face can be anywhere in frame, moving, small, turned or absent | AP50, recall, FP/frame, centre error, jitter, speed, memory | Camera, lighting, motors |
+| **Virtual gimbal** (below) | One wide recorded video | A crop window, driven by the tracker | Closed-loop metrics with the model's real frame rate, but deterministic | Lighting, motors, run-to-run variation |
+| **Physical rig** (this section) | Face on a monitor, scripted trajectories | The real gimbal | Closed-loop metrics including blur and servo response | Subject and trajectory variation |
+
+**Virtual gimbal replay.**
+1. Record a wide, high-resolution video (wider field of view than the OV2640) of a person moving, and label face positions in it (T0 auto-labels, then spot-check).
+2. The model's camera is a window cropped from each video frame, sized to the OV2640's 54°×41° field of view and scaled to the model's input (320×240 on the ESP32).
+3. The tracker controller (same gain, deadband and speed limits as §8 item 7) moves the window instead of the servos, at most `kTrackSpeedDegS`.
+4. **Model speed counts.** A model only gets a new frame when it has finished the last one: a model whose detect time is 45 ms on a 30 fps video skips frames, a 15 ms model doesn't. On the ESP32 the crop is sent over USB and the detect time used is the device's own; the Pi runs the same loop locally.
+5. The host computes the §7 closed-loop metrics against the labelled face positions: RMS error, time-on-target, lock ratio, reacquire time.
+
+The same video is used for every model and both platforms, so differences come from detection accuracy and speed alone. It doesn't capture motion blur from a moving camera, servo dynamics or real lighting; the physical rig covers those.
 
 ---
 

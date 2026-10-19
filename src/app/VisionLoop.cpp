@@ -13,7 +13,11 @@ constexpr const char *TAG = "vision";
 constexpr int kTaskPriority = 3;
 constexpr int kTaskStack = 16384;
 constexpr TickType_t kIdleWait = pdMS_TO_TICKS(50);
-constexpr TickType_t kTelemetryTimeout = pdMS_TO_TICKS(5);
+// Telemetry is queued and sent from its own task, so a live-view frame holding the link
+// never costs a telemetry packet. 32 packets is ~1.8 s of frames at 18 fps.
+constexpr UBaseType_t kTelemetryDepth = 32;
+constexpr int kTelemetryTaskPriority = 2;   // above the preview task, below the vision task
+constexpr int kTelemetryTaskStack = 3072;
 } // namespace
 
 VisionLoop::VisionLoop(PanTilt &mount, Link &link, DetectorSlot &slot, BenchService &bench, PreviewStreamer &preview)
@@ -23,15 +27,33 @@ VisionLoop::VisionLoop(PanTilt &mount, Link &link, DetectorSlot &slot, BenchServ
 
 VisionLoop::~VisionLoop() {
     if (task_) vTaskDelete(task_);
+    if (telemetryTask_) vTaskDelete(telemetryTask_);
+    if (telemetryQueue_) vQueueDelete(telemetryQueue_);
 }
 
 void VisionLoop::start(std::string_view modelId) {
     initialModel_ = modelId;
+    telemetryQueue_ = xQueueCreate(kTelemetryDepth, sizeof(proto::TelemetryMsg));
+    if (!telemetryQueue_) ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    xTaskCreatePinnedToCore(telemetryEntry, "telemetry", kTelemetryTaskStack, this, kTelemetryTaskPriority,
+                            &telemetryTask_, 0);
     xTaskCreatePinnedToCore(taskEntry, "vision", kTaskStack, this, kTaskPriority, &task_, 1);
 }
 
 void VisionLoop::taskEntry(void *arg) {
     static_cast<VisionLoop *>(arg)->run();
+}
+
+void VisionLoop::telemetryEntry(void *arg) {
+    static_cast<VisionLoop *>(arg)->telemetryLoop();
+}
+
+void VisionLoop::telemetryLoop() {
+    proto::TelemetryMsg msg{};
+    while (true) {
+        if (xQueueReceive(telemetryQueue_, &msg, portMAX_DELAY) != pdTRUE) continue;
+        link_.send(proto::MsgType::Telemetry, {proto::bytesOf(msg)});
+    }
 }
 
 void VisionLoop::run() {
@@ -144,8 +166,10 @@ void VisionLoop::onTrackFrame(const TrackSample &sample) {
         msg.tiltTarget = sample.tiltTarget;
         if (sample.targetIndex >= 0) msg.target = toWire(sample.faces[sample.targetIndex]);
         msg.timing = toWire(sample.timing);
-        // Short timeout: telemetry is dropped rather than slowing the tracker down
-        link_.send(proto::MsgType::Telemetry, {proto::bytesOf(msg)}, kTelemetryTimeout);
+        // Never wait: if the queue is full the packet is dropped rather than slowing the tracker
+        if (xQueueSend(telemetryQueue_, &msg, 0) != pdTRUE && ++telemetryDropped_ % 100 == 1) {
+            ESP_LOGW(TAG, "Telemetry queue full (%lu dropped)", static_cast<unsigned long>(telemetryDropped_));
+        }
     }
 
     preview_.offer(PreviewFrame{

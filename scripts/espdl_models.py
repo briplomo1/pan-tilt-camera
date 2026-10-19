@@ -3,7 +3,7 @@
 # The human_face_detect component packs its .espdl model files and turns them
 # into an assembly file (human_face_detect.espdl.S) with CMake custom commands.
 # PlatformIO compiles the sources CMake reports but never runs those commands,
-# so this script does the same two steps before the build starts.
+# so this script does the same two steps itself.
 
 import os
 import subprocess
@@ -49,9 +49,11 @@ def is_stale(target, sources):
     return any(os.path.getmtime(s) > built for s in sources)
 
 
-def generate():
+def generate(required=False):
     if not os.path.isdir(MODELS_DIR):
-        return  # component not downloaded yet; CMake will fetch it on this run
+        if required:
+            raise RuntimeError(f"human_face_detect models not found in {MODELS_DIR}")
+        return  # component not downloaded yet; the build step below generates it once it is
 
     models = enabled_models()
     if not models:
@@ -81,4 +83,7 @@ def generate():
         ], cwd=BUILD_DIR)
 
 
+# On a fresh checkout the component isn't downloaded yet when this script loads, so also
+# register the .S as a build step: SCons runs it when the compiler first needs the file
+env.Command(ASM, [], lambda target, source, env: generate(required=True))
 generate()

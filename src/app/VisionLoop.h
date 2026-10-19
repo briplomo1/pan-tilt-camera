@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "freertos/task.h"
 #include "PanTilt.h"
 #include "Tracker.h"
@@ -30,11 +31,16 @@ private:
     Tracker tracker_;
     proto::Mode mode_ = proto::Mode::Track;
     bool telemetry_ = false;
+    QueueHandle_t telemetryQueue_ = nullptr;   // TelemetryMsg waiting for the telemetry task
+    TaskHandle_t telemetryTask_ = nullptr;
+    uint32_t telemetryDropped_ = 0;
     std::string initialModel_;
     TaskHandle_t task_ = nullptr;
 
     static void taskEntry(void *arg);
     [[noreturn]] void run();
+    static void telemetryEntry(void *arg);
+    [[noreturn]] void telemetryLoop();
     void dispatch(const RxPacket &packet);
     void hello();
     void setMode(const RxPacket &packet);

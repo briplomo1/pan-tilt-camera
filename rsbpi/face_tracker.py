@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
+import collections
+import getpass
 import json
 import math
 import os
@@ -259,6 +261,24 @@ def latency_stats(values_us):
     }
 
 
+def frame_row(frame_id, capture_time_us, state, timing, candidates, target_index,
+              pan, tilt, pan_target, tilt_target, command_us):
+    """One frame's metrics, shared by Metrics and ClipRecorder."""
+    return {
+        "frame_id": frame_id,
+        "time_us": capture_time_us,
+        "state": state,
+        "timing_us": timing,
+        "faces": [{"box": [c[0], c[1], c[2], c[3]], "score": round(c[4], 4)} for c in candidates],
+        "target_index": target_index,
+        "pan": pan,
+        "tilt": tilt,
+        "pan_target": pan_target,
+        "tilt_target": tilt_target,
+        "capture_to_command_us": command_us,
+    }
+
+
 class Metrics:
     """Per-frame JSONL + summary.json for the live tracker, disabled unless --metrics-out is set."""
 
@@ -288,27 +308,13 @@ class Metrics:
             "opencv_version": cv2.__version__,
         }
 
-    def record_frame(self, frame_id, capture_time_us, state, timing, candidates, target_index,
-                      pan, tilt, pan_target, tilt_target, command_us):
+    def record_frame(self, row):
         if not self.enabled:
             return
         self.frame_index += 1
-        self.totals_us.append(timing["total_us"])
+        self.totals_us.append(row["timing_us"]["total_us"])
         if self.frame_index % self.every_n != 0:
             return
-        row = {
-            "frame_id": frame_id,
-            "time_us": capture_time_us,
-            "state": state,
-            "timing_us": timing,
-            "faces": [{"box": [c[0], c[1], c[2], c[3]], "score": round(c[4], 4)} for c in candidates],
-            "target_index": target_index,
-            "pan": pan,
-            "tilt": tilt,
-            "pan_target": pan_target,
-            "tilt_target": tilt_target,
-            "capture_to_command_us": command_us,
-        }
         self.rows.write(json.dumps(row) + "\n")
 
     def finalize(self, frame_count, wall_time_s):
@@ -339,6 +345,110 @@ class Metrics:
         print(f"Loop FPS mean: {summary['loop_fps_mean']:.1f}  Peak RSS: {rss_peak_kb} KB "
               f"(+{summary['memory']['rss_delta_kb']} KB)")
         print(f"Wrote {self.rows_path} and {self.run}.summary.json")
+
+
+# --------------------------------------------------------------------------
+# Clip recorder: annotated MP4 + per-frame JSONL + summary.json per sighting,
+# saved on the Pi to pull off later with scp
+# --------------------------------------------------------------------------
+class ClipRecorder:
+    """A clip starts on the first detected face, including `preroll_s` seconds of lead-in, runs
+    while faces keep appearing and ends `tail_s` seconds after the last one (or at `max_s`)."""
+
+    def __init__(self, out_dir, fps, preroll_s, tail_s, max_s, identity):
+        self.enabled = out_dir is not None
+        self.fps = fps
+        self.preroll_s = preroll_s
+        self.tail_s = tail_s
+        self.max_s = max_s
+        self.identity = identity
+        self.preroll = collections.deque()   # (t, annotated frame, row) while not recording
+        self.writer = None
+        if self.enabled:
+            self.out_dir = Path(out_dir).resolve()
+            self.out_dir.mkdir(parents=True, exist_ok=True)
+
+    @property
+    def recording(self):
+        return self.writer is not None
+
+    def add(self, t, frame, face_seen, row):
+        """`t` in seconds (monotonic), `frame` already annotated."""
+        if not self.enabled:
+            return
+        if not self.recording:
+            self.preroll.append((t, frame.copy(), row))
+            while t - self.preroll[0][0] > self.preroll_s:
+                self.preroll.popleft()
+            if face_seen:
+                self._start(frame.shape, self.preroll[0][0], t)
+                for item in self.preroll:
+                    self._write(*item)
+                self.preroll.clear()
+            return
+
+        self._write(t, frame, row)
+        if face_seen:
+            self.last_face_t = t
+        if t - self.last_face_t > self.tail_s or t - self.start_t > self.max_s:
+            self.stop()
+
+    def _start(self, shape, start_t, face_t):
+        h, w = shape[:2]
+        self.name = f"clip-{time.strftime('%Y%m%d-%H%M%S')}"
+        self.video_path = self.out_dir / f"{self.name}.mp4"
+        self.writer = cv2.VideoWriter(str(self.video_path), cv2.VideoWriter_fourcc(*"mp4v"), self.fps, (w, h))
+        if not self.writer.isOpened():
+            # Some OpenCV builds lack an MP4 encoder; MJPEG in AVI always works
+            self.video_path = self.out_dir / f"{self.name}.avi"
+            self.writer = cv2.VideoWriter(str(self.video_path), cv2.VideoWriter_fourcc(*"MJPG"), self.fps, (w, h))
+        self.rows_path = self.out_dir / f"{self.name}.jsonl"
+        self.rows = self.rows_path.open("w")
+        self.start_t = start_t
+        self.last_face_t = face_t
+        self.started_at = time.strftime("%Y-%m-%dT%H:%M:%S")
+        self.video_frames = 0
+        self.frames = []
+        print(f"Face seen - recording {self.video_path.name}")
+
+    def _write(self, t, frame, row):
+        # Repeat frames so the video plays back in real time whatever the loop rate is
+        target = int((t - self.start_t) * self.fps) + 1
+        while self.video_frames < target:
+            self.writer.write(frame)
+            self.video_frames += 1
+        self.rows.write(json.dumps({"clip_time_s": round(t - self.start_t, 3), **row}) + "\n")
+        self.frames.append((t, row))
+
+    def stop(self):
+        if not self.recording:
+            return
+        self.writer.release()
+        self.writer = None
+        self.rows.close()
+
+        duration = self.frames[-1][0] - self.start_t if self.frames else 0.0
+        rows = [r for _, r in self.frames]
+        with_face = sum(1 for r in rows if r["target_index"] >= 0)
+        pans, tilts = [r["pan"] for r in rows], [r["tilt"] for r in rows]
+        summary = {
+            "clip": self.name,
+            "video": self.video_path.name,
+            "started_at": self.started_at,
+            **self.identity,
+            "duration_s": round(duration, 2),
+            "frames": len(rows),
+            "frames_with_face": with_face,
+            "face_fraction": round(with_face / len(rows), 3) if rows else 0.0,
+            "loop_fps_mean": round(len(rows) / duration, 2) if duration > 0 else 0.0,
+            "video_fps": self.fps,
+            "detect_total": latency_stats([r["timing_us"]["total_us"] for r in rows]),
+            "capture_to_command": latency_stats([r["capture_to_command_us"] for r in rows]),
+            "pan_range": [min(pans), max(pans)] if pans else None,
+            "tilt_range": [min(tilts), max(tilts)] if tilts else None,
+        }
+        (self.out_dir / f"{self.name}.summary.json").write_text(json.dumps(summary, indent=2))
+        print(f"Saved {self.video_path.name}: {duration:.1f} s, face in {summary['face_fraction']:.0%} of frames")
 
 
 # --------------------------------------------------------------------------
@@ -548,6 +658,12 @@ def parse_args():
     p.add_argument("--metrics-out", default=None, help="write per-frame JSONL + summary.json metrics to this directory")
     p.add_argument("--metrics-every", type=int, default=1, help="log every Nth frame to metrics (reduces overhead)")
     p.add_argument("--metrics-tag", default="haar-default", help="label folded into the metrics run id")
+    p.add_argument("--record-dir", default="recordings", help="save a clip (video + JSONL + summary) each time a face is seen")
+    p.add_argument("--no-record", action="store_true", help="don't save clips")
+    p.add_argument("--record-fps", type=float, default=15.0, help="playback rate of saved clips")
+    p.add_argument("--record-preroll", type=float, default=2.0, help="seconds before the first detection to include")
+    p.add_argument("--record-tail", type=float, default=3.0, help="stop a clip this many seconds after the face is lost")
+    p.add_argument("--record-max", type=float, default=120.0, help="split clips longer than this many seconds")
     p.add_argument("--images", default=None, help="accuracy mode: score a labeled folder of images instead of live tracking")
     p.add_argument("--gt", default=None, help='ground-truth JSON for --images: {"relative/path.jpg": [[x0,y0,x1,y1], ...]}')
     p.add_argument("--iou-thresh", type=float, default=0.5, help="IoU for a detection to count as a match (AP50 default: 0.5)")
@@ -572,8 +688,16 @@ def main():
     pantilt = PanTilt(args.servos, args.pan_pin, args.tilt_pin, args.pan_ch, args.tilt_ch)
     streamer = Streamer(args.port)
     metrics = Metrics(args.metrics_out, args.metrics_tag, args.metrics_every, model_path, load_us)
+    recorder = ClipRecorder(
+        None if args.no_record else args.record_dir, args.record_fps, args.record_preroll,
+        args.record_tail, args.record_max,
+        {"model": "haar-frontalface", "backend": "opencv-haar", "host": socket.gethostname()},
+    )
 
     print(f"Tracking. View the stream at http://<your-pi-hostname>.local:{args.port}  (Ctrl+C to stop)")
+    if recorder.enabled:
+        print(f"Saving clips to {recorder.out_dir}. Pull them with:\n"
+              f"  scp -r {getpass.getuser()}@{socket.gethostname()}.local:{recorder.out_dir} .")
 
     pan_sign = 1 if args.invert_pan else -1
     tilt_sign = -1 if args.invert_tilt else 1
@@ -608,8 +732,13 @@ def main():
                 pantilt.nudge(d_pan, d_tilt)
                 pan_target, tilt_target = pantilt.pan, pantilt.tilt
 
+            for bx, by, bw, bh, bscore in candidates:
+                cv2.rectangle(frame, (bx, by), (bx + bw, by + bh), (160, 160, 160), 1)
+                cv2.putText(frame, f"{bscore:.1f}", (bx, by - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
+            if face is not None:
                 cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
                 cv2.circle(frame, (int(fx), int(fy)), 4, (0, 255, 0), -1)
+                cv2.line(frame, (int(cx), int(cy)), (int(fx), int(fy)), (0, 255, 0), 1)
 
             command_us = int((time.perf_counter() - capture_t0) * 1e6)
 
@@ -621,12 +750,19 @@ def main():
             last = now
             status = f"FPS {fps:4.1f}  pan {pantilt.pan:5.1f}  tilt {pantilt.tilt:5.1f}"
             cv2.putText(frame, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-
             state = "track" if face is not None else "scan"
-            metrics.record_frame(frame_id, int(capture_t0 * 1e6), state, timing, candidates, target_index,
-                                  pantilt.pan, pantilt.tilt, pan_target, tilt_target, command_us)
+            detail = (f"{state}  detect {timing['total_us'] / 1000:5.1f} ms  faces {len(candidates)}  "
+                      f"cmd {command_us / 1000:5.1f} ms  {time.strftime('%H:%M:%S')}")
+            cv2.putText(frame, detail, (10, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
+            row = frame_row(frame_id, int(capture_t0 * 1e6), state, timing, candidates, target_index,
+                            pantilt.pan, pantilt.tilt, pan_target, tilt_target, command_us)
+            metrics.record_frame(row)
+            recorder.add(capture_t0, frame, face is not None, row)
             frame_id += 1
 
+            if recorder.recording:
+                cv2.circle(frame, (FRAME_W - 20, 20), 8, (0, 0, 255), -1)  # REC dot, live view only
             streamer.update(frame)
 
             if args.display:
@@ -637,6 +773,7 @@ def main():
         pass
     finally:
         print("\nShutting down...")
+        recorder.stop()
         metrics.finalize(frame_id, time.monotonic() - started)
         pantilt.center()
         time.sleep(0.3)

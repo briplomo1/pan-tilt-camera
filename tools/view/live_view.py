@@ -6,10 +6,15 @@
 
 Keys
     q / Esc   quit                      space   freeze the display
-    s         snapshot (PNG + JSON)     r       start/stop recording (MP4 + JSONL)
+    s         snapshot (PNG + JSON)     r       start/stop recording (see below)
     m         next model                + / -   score threshold up / down
     p         next preview format       t       pause/resume tracking (bench/track mode;
                                                 the feed stops while paused)
+
+A recording writes three files to --out:
+    live-*.mp4            the annotated view (only the frames the preview managed to send)
+    live-*.jsonl          one line per tracker frame from telemetry: every frame, for metrics
+    live-*.preview.jsonl  one line per video frame, with every detected face
 
 Streaming costs the device some CPU and USB bandwidth. Turn it off for measured runs
 (docs/EXPERIMENT_PLAN.md, "observer effect").
@@ -21,6 +26,7 @@ import collections
 import json
 import queue
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -113,23 +119,58 @@ def metadata(preview: p.Preview) -> dict:
     }
 
 
+def telemetry_row(t: p.Telemetry, source: list[int] | None) -> dict:
+    target = None
+    if t.target:
+        target = {"box": [t.target.x0, t.target.y0, t.target.x1, t.target.y1], "score": round(t.target.score, 4)}
+    return {
+        "frame_id": t.frame_id, "time_us": t.time_us, "state": p.TRACKER_STATES.get(t.state, t.state),
+        "pan": round(t.pan, 2), "tilt": round(t.tilt, 2),
+        "pan_target": round(t.pan_target, 2), "tilt_target": round(t.tilt_target, 2),
+        "face_count": t.face_count, "target": target, "timing_us": t.timing.as_dict(), "source": source,
+    }
+
+
 class Recorder:
-    """MP4 of the annotated view plus one JSON line of detections per frame."""
+    """MP4 of the annotated view, every tracker frame's telemetry, and the video frames' detections."""
 
     def __init__(self, folder: Path, size: tuple[int, int], fps: float):
         folder.mkdir(parents=True, exist_ok=True)
         stamp = time.strftime("%Y%m%d-%H%M%S")
         self.video_path = folder / f"live-{stamp}.mp4"
         self.writer = cv2.VideoWriter(str(self.video_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, size)
-        self.log = open(folder / f"live-{stamp}.jsonl", "w")
+        self.preview_log = open(folder / f"live-{stamp}.preview.jsonl", "w")
+        # Telemetry arrives on the link's reader thread
+        self.lock = threading.Lock()
+        self.telemetry_log = open(folder / f"live-{stamp}.jsonl", "w")
+        self.first_id: int | None = None
+        self.last_id: int | None = None
+        self.rows = 0
 
     def write(self, frame: np.ndarray, meta: dict) -> None:
         self.writer.write(frame)
-        self.log.write(json.dumps(meta) + "\n")
+        self.preview_log.write(json.dumps(meta) + "\n")
+
+    def write_telemetry(self, row: dict) -> None:
+        with self.lock:
+            if self.telemetry_log.closed:
+                return
+            self.telemetry_log.write(json.dumps(row) + "\n")
+            if self.first_id is None:
+                self.first_id = row["frame_id"]
+            self.last_id = row["frame_id"]
+            self.rows += 1
 
     def close(self) -> None:
         self.writer.release()
-        self.log.close()
+        self.preview_log.close()
+        with self.lock:
+            self.telemetry_log.close()
+        if self.first_id is not None:
+            expected = self.last_id - self.first_id + 1
+            print(f"Telemetry: {self.rows} of {expected} tracker frames logged ({expected - self.rows} missing)")
+        else:
+            print("Telemetry: no frames logged")
 
 
 def main() -> None:
@@ -156,6 +197,15 @@ def main() -> None:
             pass
         latest.put_nowait(packet)
 
+    recorder: Recorder | None = None
+    source: list[int] | None = None
+
+    def on_telemetry(packet: p.Packet) -> None:
+        # Every tracker frame, unlike the preview, which skips frames while it's still sending
+        active = recorder
+        if active:
+            active.write_telemetry(telemetry_row(p.Telemetry.parse(packet.payload), source))
+
     out_dir = Path(args.out)
     with DeviceLink(args.port) as device:
         hello = device.hello()
@@ -173,11 +223,12 @@ def main() -> None:
         mode = p.Mode.TRACK
         device.set_mode(mode)
         device.on(p.Msg.PREVIEW, on_preview)
+        device.on(p.Msg.TELEMETRY, on_telemetry)
         device.set_preview(True, fmt, SCALES[args.scale], args.every, args.quality)
+        device.subscribe(True)
 
         view_rate, device_rate = Rate(), Rate()
         shown = 0
-        recorder: Recorder | None = None
         frozen = False
         last_canvas: np.ndarray | None = None
         last_meta: dict | None = None
@@ -210,6 +261,7 @@ def main() -> None:
                         hud.append(f"REC {recorder.video_path.name}")
                     last_canvas = draw(preview, image, args.zoom, hud)
                     last_meta = metadata(preview)
+                    source = last_meta["source"]
                     if recorder:
                         recorder.write(last_canvas, last_meta)
                     cv2.imshow(window, last_canvas)
@@ -267,6 +319,7 @@ def main() -> None:
                 print(f"Saved {recorder.video_path}")
             cv2.destroyAllWindows()
             try:
+                device.subscribe(False)
                 device.set_preview(False)
                 device.set_mode(p.Mode.TRACK)
             except (DeviceError, TimeoutError, OSError):

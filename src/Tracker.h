@@ -42,8 +42,9 @@ protected:
 /**
  * Scan / track logic, one camera frame per step().
  *
- *  SCAN:   sweep pan back and forth, stepping tilt to a new row at each end,
- *          running face detection on every frame.
+ *  SCAN:   step pan across its range, pausing at each stop so the camera gets a
+ *          sharp frame, and move tilt to a new row at each end. Face detection
+ *          runs on every frame.
  *  TRACK:  steer so the face sits in the middle of the frame. If no face is seen
  *          for kLostTimeoutUs, go back to SCAN from wherever the mount is.
  *  PAUSED: mount held still (benchmark mode); step() does nothing.
@@ -57,6 +58,7 @@ private:
     TrackState state_ = TrackState::Scan;
     int scanDir_ = 1;              // +1 sweeping toward pan max, -1 toward pan min
     size_t scanRow_ = 0;
+    int64_t scanArrivedUs_ = 0;    // when the mount reached the current scan stop, 0 while moving
     int64_t lastSeenUs_ = 0;
     std::optional<Face> lastFace_;
     float panTarget_ = 0.0f;
@@ -68,7 +70,7 @@ private:
 
     void enterScan();
     void enterTrack();
-    void scanStep();
+    void scanStep(int64_t now);
     void steerToward(const Face &face, int frameW, int frameH, float panAtCapture, float tiltAtCapture);
     [[nodiscard]] int pickFace(std::span<const Face> faces) const;
     [[nodiscard]] float scanRowTilt() const;
