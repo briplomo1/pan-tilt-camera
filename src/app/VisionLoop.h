@@ -47,6 +47,7 @@ private:
     void subscribe(const RxPacket &packet);
     void sync(const RxPacket &packet);
     void setPreview(const RxPacket &packet);
+    void setTracker(const RxPacket &packet);
     void onTrackFrame(const TrackSample &sample) override;
 
 public:

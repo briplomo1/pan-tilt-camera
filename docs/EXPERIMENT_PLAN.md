@@ -7,7 +7,8 @@
 | Phase | State |
 |---|---|
 | **Phase 0** — infrastructure + baseline | **Implemented**: baseline B0 behind `IDetector`, detector registry, `ModelStore` (model partition), memory probes, USB link (both directions), bench service, live view, host tools. Firmware builds. Waiting for on-device verification (§12) and first baseline numbers (§13). How to run it: `docs/USAGE.md`. |
-| Phases 1–10 | Not started. Training work lives in `notebooks/` (placeholders, no code yet). |
+| **Tooling for Phases 1–2** (2026-10-25) | **Implemented**, host-tested: video/image streaming to any set of models (`run_bench.py`), scorer (`tools/eval/score.py`), model comparison table + Pareto plot (`compare.py`), tracking metrics (`closed_loop.py`, reproduces the checkpoint numbers), virtual gimbal (`tools/rig/`), dataset tools (`tools/data/`: capture sessions, WIDER prep, negatives, auto-label, label, session split). Kalman filter finished (coast, bounded lead, stale restart, run-time A/B switch, telemetry; protocol v2). Needs on-board runs. |
+| Phases 1–10 | Data collection and model work not started. Models chosen 2026-10-25 (§9.0). Step-by-step checklist to the end of the project: `docs/TODO.md`. |
 
 **Notebooks** (`notebooks/`). Each starts with a header cell stating its purpose, the experiment IDs it covers, inputs/outputs, dependencies and the steps to be filled in later. There is no training code in them yet.
 
@@ -15,12 +16,10 @@
 |---|---|
 | `00_toolchain_and_fidelity.ipynb` | Phase 3: PyTorch/PT2E → ai-edge-torch (fallback onnx2tf) → `.tflite`; fidelity test PyTorch vs TFLite-PC vs device |
 | `01_datasets.ipynb` | Phase 1: WIDER subset (A-train/A-test), negatives, captured set B, letterbox → QVGA RGB565-BE, splits |
-| `10_blazeface.ipynb` | P1 / Q1 |
-| `11_ultralight_slim320.ipynb` | P2 / Q2 |
-| `12_ultralight_rfb320.ipynb` | P3 / Q3 |
-| `13_yunet.ipynb` | P4a/b / Q4 |
-| `14_scrfd_500m.ipynb` | P5 / Q5 |
-| `20_teacher_yolo11n.ipynb` | T0 (PC-only ceiling and distillation teacher) |
+| `14_scrfd_500m.ipynb` | **Primary model**: S0–S5 (SCRFD-0.5GF ladder), S-DL |
+| `15_yolov5n_face.ipynb` *(to create)* | **Second family**: Y0–Y4 (YOLOv5n-0.5-face ladder) |
+| `20_teacher_yolo11n.ipynb` | T0 (PC-only ceiling); also hosts the teachers T2 (SCRFD-10GF) and T3 (YOLOv5s-face) |
+| `10_blazeface.ipynb`, `11_ultralight_slim320.ipynb`, `12_ultralight_rfb320.ipynb`, `13_yunet.ipynb` | Deferred (§9, "Deferred candidates"); only if time allows |
 | `21_custom_detector.ipynb` | C1 (ReLU-only, QAT + KD) |
 | `30_granularity_pot.ipynb` | G1–G4 (per-channel / per-tensor / PoT, PTQ vs QAT) |
 | `31_precision.ipynb` | W1–W3 (16×8, W4A8, mixed) |
@@ -47,6 +46,11 @@ The deliverable is a report of **accuracy vs speed vs memory**, plus **closed-lo
 | Persistence | `Storage` class for all settings and partitions (lazy NVS init) | Done this session |
 | Servo range | Full 0–180° on both axes (calibrated pulse ends) | Done this session |
 | Old `src/main.c` | Kept, commented out | Done this session |
+| **Models to beat B0** (2026-10-25) | **SCRFD-0.5GF** (primary) and **YOLOv5n-0.5-face** (second family) | Small enough for the latency budget (est. ~70–75 ms at 320×240, less at lower resolution). SCRFD-10GF and YOLOv5s-face were considered and rejected for the device: est. ~1.3 s and ~0.8 s per frame at 320×240, and YOLOv5s-face (~7 MB int8) does not fit the 4 MB model partition. See §9.0 |
+| Teachers | SCRFD-10GF for SCRFD, YOLOv5s-face for YOLOv5n (same family, same box/anchor format) | PC-only accuracy ceilings and distillation teachers (T2, T3) |
+| Improvement ladder | Float → PTQ → QAT → QAT + distillation → + fine-tune on set B, then resolution and placement | One change per step, so each step's gain is measured on its own (§9.0) |
+| Fit weights into the 512 KB SRAM / int4? | **No, not as a goal.** Group M decides: W4A8 only if SRAM-resident weights are > 25 % faster | Weights run from flash through the cache; only ~150–200 KB SRAM is free; the S3 has no int4 arithmetic; the chip is expected to be compute-bound (§9.0) |
+| Runtime cross-check | Also export the best SCRFD model through ESP-PPQ to ESP-DL (S-DL) | Separates model from runtime: shows whether the new model beats MSR+MNP on Espressif's own kernels; fallback if TFLM+ESP-NN is slow |
 | Live view | Device streams preview frames + detection metadata over the same USB link; the **host draws** boxes and labels in a window and can record MP4 | Keeps device cost to a frame copy (+ optional JPEG on core 0), keeps raw frames clean, reuses the link. WiFi/MJPEG was rejected: adds ~50–70 KB internal RAM and radio load to a memory-limited study. |
 
 ---
@@ -226,6 +230,13 @@ Every experiment fills one row of this table. Columns are grouped by category.
    | `kLostTimeoutUs` | 3 s | B0 misses runs of frames (up to ~1.3 s) with the face in view |
    | Scan tilt | level 150°, rows ±20° | Scan centred on the horizon, not the tilt-range middle |
    | Camera exposure | `ae_level` +1 | Faces against a bright window were too dark |
+   | `kFilterFace` | on (Kalman, constant velocity) | Smooths detections and aims ahead to offset the ~55 ms frame delay. Added after the checkpoint: the checkpoint B0 recordings are the filter-off reference |
+   | `kFaceAccelNoise` / `kFaceMeasNoise` / `kFaceGate` | 150 °/s² / 0.6° / 4 σ | Heads change speed quickly; ~3–4 px detection jitter; outliers beyond 4 σ ignored (3 in a row restart the filter) |
+   | `kLeadS` | 50 ms past the frame's processing time | Roughly the servo response; lead speed capped at `kTrackSpeedDegS` |
+   | `kCoastS` | 0.3 s | Follow the prediction through B0's typical single-frame misses, then hold until `kLostTimeoutUs` |
+   | `kFilterStaleUs` | 0.5 s | After a longer miss the velocity is stale, so the filter restarts |
+
+   The filter settings are provisional until the on-board A/B run (`live_view.py`, key `f`, analysed with `closed_loop.py`); freeze them before recording L-B0. `tools/rig/controller.py` mirrors this controller for the virtual gimbal and reads these constants from `src/Tracker.cpp`.
 
 ### 8.1 How tracking is compared across models: three tests
 
@@ -256,6 +267,44 @@ Notes:
 - FLOP-based latency estimates assume ~1.4 GFLOP/s, measured for ESP-DL. TFLM+ESP-NN efficiency is unknown until K1.
 - Candidate operator support and convertibility are unverified. Each must pass an export check first; a candidate that fails is recorded as "not deployable" with the reason, which is itself a result.
 
+### 9.0 Model selection and how we try to beat B0 (decided 2026-10-25)
+
+**What B0 is weak at:** its first stage sees only 160×120, so small or far faces are missed, and its two stages cost 45 ms (measured). A new model wins if it is more accurate at a similar latency, faster at a similar accuracy, or both.
+
+**Candidates.** Estimates scale published FLOPs to the input size at ~1.4 GFLOP/s (ESP-DL's rate); TFLM+ESP-NN may be slower, and K1 replaces these with measurements. Parameter and FLOP figures are to be confirmed against each model's repository.
+
+| Model | Role | Params (int8 size) | Est. compute / latency at 320×240 | Notes |
+|---|---|---|---|---|
+| **SCRFD-0.5GF** | Primary on-device model | ~0.57 M (~0.6 MB) | ~0.1 GFLOP / ~70 ms (~20 ms at 160×120) | Single stage, plain conv + BN + ReLU: int8-friendly |
+| **YOLOv5n-0.5-face** | Second family | ~0.45 M (~0.5 MB) | ~0.1 GFLOP / ~75 ms | ShuffleNet-style channel split/shuffle and anchor decode; SiLU swapped for ReLU |
+| SCRFD-2.5GF, YOLOv5n-face | Optional larger steps in each family | ~0.7 M / ~1.7 M | ~0.45 GFLOP / ~300 ms (~75–90 ms at 160×120) | Accuracy/latency trade-off points |
+| SCRFD-10GF (T2), YOLOv5s-face (T3) | PC-only ceilings and teachers | ~3.9 M / ~7.1 M | ~1.9 / ~1.1 GFLOP, ~1.3 s / ~0.8 s | Not deployed: too slow; YOLOv5s-face exceeds the 4 MB partition |
+
+**The improvement ladder (same for both families).** Each rung changes one thing. Rungs 1–4 keep the graph and the int8 ops, so latency stays fixed and only accuracy moves (GH1).
+
+| Rung | Approach | What it buys |
+|---|---|---|
+| 0 | Float model, PC only | Reference for the quantization drop ΔAP |
+| 1 | **PTQ** int8 per-channel (calibration: A-cal + B-cal) | The deployed latency and the raw quantization cost |
+| 2 | **QAT** (fine-tune with fake-quant) | Recovers the PTQ drop |
+| 3 | **QAT + knowledge distillation** from the family's teacher | Usually the largest gain for small students |
+| 4 | **+ fine-tune on set B** (own camera, own room) | Task accuracy on B-test, which drives tracking |
+| 5 | **Resolution** 160×120 / 224×168 / 320×240 (group R) | The main latency lever (cost ∝ pixels) |
+
+Model changes made before training, for both families: swap SiLU → ReLU (YOLOv5n), drop the 5-point landmark branch (the tracker doesn't use it), keep only ops ESP-NN accelerates (export check first).
+
+**Not pursued as a goal: squeezing the model into the 512 KB SRAM.** Weights are read from flash through the cache and reused heavily, and the S3 is expected to be compute-bound (GH5). Only ~150–200 KB of SRAM is actually free, against ~0.5–0.6 MB for the int8 candidates, so fitting would need int4 weights; the S3 has no int4 arithmetic, which means a custom unpack kernel and 4-bit QAT. Activations (a 16-channel 160×120 int8 map is ~300 KB) matter more than weights for SRAM. Group M measures it once on the best model; W2 (W4A8) runs only if SRAM-resident weights are > 25 % faster. Cutting compute (resolution, width, ReLU) is the expected route to lower latency.
+
+**Expected ranking against B0** (hypotheses, written before running):
+
+| Rank | Combination | Expected vs B0 |
+|---|---|---|
+| 1 | SCRFD-0.5GF, QAT + KD + set B, at 224×168 or 160×120 | **Beats B0 on both**: similar or lower latency, better small-face recall |
+| 2 | SCRFD-0.5GF, same recipe, 320×240 | Clearly more accurate (S bucket), slower than B0: an accuracy win |
+| 3 | YOLOv5n-0.5-face (ReLU), QAT + KD | Similar latency to rank 1; riskier (split/shuffle ops may run slowly or quantize worse) |
+| 4 | YOLOv5n-face (full width), 160×120 | Accuracy win; ~1.5–2× B0 latency |
+| — | Any candidate with PTQ only | Does **not** beat B0 on accuracy: small models lose most from PTQ (GH2) |
+
 ### Group B — Baseline and vendor references (ESP-DL, vendor PTQ, w8a8 PoT per-tensor, flash rodata)
 | ID | Model | Input | Expected | Hypothesis / purpose | Result | Conclusion |
 |---|---|---|---|---|---|---|
@@ -268,8 +317,10 @@ Notes:
 ### Group T — PC-only references (no device)
 | ID | Model | Purpose | Expected |
 |---|---|---|---|
-| T0 | YOLO11n-face, float32, 640 | Accuracy ceiling. Distillation teacher. | AP50 far above all on-device models |
-| T1 | Each Stack-B model in float32 (PyTorch) | Reference for ΔAP quantization drop | — |
+| T0 | YOLO11n-face, float32, 640 | General accuracy ceiling | AP50 far above all on-device models |
+| T1 | Each Stack-B model in float32 (PyTorch) | Reference for the ΔAP quantization drop (rung 0) | — |
+| T2 | SCRFD-10GF, float32 | Ceiling and distillation teacher for the SCRFD family | AP50 well above the S rows; S3 vs S2 shows what KD recovers |
+| T3 | YOLOv5s-face, float32 | Ceiling and distillation teacher for the YOLOv5 family | Same, for the Y rows |
 
 ### Group K — Runtime/kernel ablation (TFLM, first deployable small model, int8 PTQ per-channel)
 | ID | Variant | Hypothesis | Result | Conclusion |
@@ -278,38 +329,46 @@ Notes:
 | K2 | TFLM reference C kernels (ESP-NN off) | ≥ 3× slower than K1 (GH4) | TBD | TBD |
 | K3 | TFLM float32 | ≥ 5× slower than K1, 4× model size, ΔAP ≈ 0 (GH4). Quantifies what int8 buys on this chip. | TBD | TBD |
 
-### Group P — PTQ int8 per-channel, TFLM+ESP-NN, model partition (flash-XIP)
-| ID | Model | Input | Approx. compute | Expected vs B0 | Hypothesis |
+### Group S — SCRFD-0.5GF ladder (primary; TFLM + ESP-NN, int8 per-channel, model partition flash-XIP)
+| ID | Rung | Input | Hypothesis | Result | Conclusion |
 |---|---|---|---|---|---|
-| P1 | BlazeFace (short-range) | 128×128 | very low | Faster than B0, lower AP on S faces | Fastest candidate. Small input limits range. |
-| P2 | Ultra-Light-Fast slim-320 | 320×240 | low | ≈ B0 speed, better S recall | Plain conv+ReLU: smallest PTQ drop (GH2 control) |
-| P3 | Ultra-Light-Fast RFB-320 | 320×240 | low–med | Slightly slower than P2, higher AP | Multi-branch RFB adds accuracy at modest cost |
-| P4a/b | YuNet | 160×120 / 320×240 | very low | Best AP-per-ms candidate | Purpose-built tiny face detector. Depthwise-heavy, so a **large PTQ drop** (GH2). |
-| P5 | SCRFD-0.5GF | 320×240 | ~0.1 GFLOPs | Highest AP of group, ~2× B0 latency | Strong small-face accuracy at a speed cost |
+| S0 | Float (PC) | 320×240 | AP50 above B0 on A-test and B-test, especially S-bucket recall | TBD | TBD |
+| S1 | PTQ | 320×240 | ~70 ms (K1 decides). Moderate ΔAP vs S0 (plain conv + ReLU) | TBD | TBD |
+| S2 | QAT | 320×240 | Same latency as S1 (GH1); recovers most of ΔAP | TBD | TBD |
+| S3 | QAT + KD from T2 | 320×240 | Above S2; closes part of the gap to T2 | TBD | TBD |
+| S4 | S3 + fine-tune on B-cal | 320×240 | Best B-test AP of the S rows | TBD | TBD |
+| S5-160 / S5-224 | S4 recipe at lower input | 160×120 / 224×168 | **Beats B0 on accuracy and latency** (§9.0 rank 1) | TBD | TBD |
+| S-DL | Best S model via ESP-PPQ → ESP-DL | best | Runtime cross-check on B0's own kernels (PoT per-tensor): isolates model from runtime | TBD | TBD |
 
-Result/Conclusion columns are the same as above for every row.
+### Group Y — YOLOv5n-0.5-face ladder (second family; same deployment)
+| ID | Rung | Input | Hypothesis | Result | Conclusion |
+|---|---|---|---|---|---|
+| Y0 | Float, SiLU → ReLU, landmarks dropped (PC) | 320×240 | Small AP loss from the ReLU swap vs the published model | TBD | TBD |
+| Y1 | PTQ | 320×240 | ~75 ms; larger ΔAP than S1 (split/shuffle, anchors) | TBD | TBD |
+| Y2 | QAT | 320×240 | Recovers most of ΔAP; same latency as Y1 | TBD | TBD |
+| Y3 | QAT + KD from T3 | 320×240 | Above Y2 | TBD | TBD |
+| Y4 | Y3 at the best resolution from group R | best | Competitive with S5, not better (§9.0 rank 3) | TBD | TBD |
 
-### Group Q — QAT (same models as P, int8 per-channel)
-| ID | Model | Hypothesis |
-|---|---|---|
-| Q1–Q5 | QAT versions of P1–P5 | Latency identical to the P row (GH1). ΔAP recovered: P4/P1 gain most, P2 least (GH2). At least one Q model is Pareto-better than B0 (RQ1). |
+Optional if time allows: SCRFD-2.5GF and YOLOv5n-face (full width) through rungs 1–3 at 160×120 (§9.0 rank 4).
 
-### Group G — Granularity and scale constraints (best Q model; all QAT unless noted)
+**Deferred candidates** (planned earlier, run only if time allows): BlazeFace, Ultra-Light-Fast slim/RFB-320, YuNet. Their notebooks stay as placeholders.
+
+### Group G — Granularity and scale constraints (best S model, S2/S3 recipe; all QAT unless noted)
 | ID | Scheme | Hypothesis |
 |---|---|---|
-| G1 | Per-channel weights (= the Q row) | Best accuracy |
+| G1 | Per-channel weights (= the S2 row) | Best accuracy |
 | G2 | Per-tensor, free scales | −0.5 to −2 AP50 vs G1 |
 | G3 | Per-tensor **PoT** (emulates ESP-DL constraint), deployed in TFLite | ≤ ~1 AP50 below G2 after QAT. Same latency (TFLM gains nothing from PoT), which isolates the accuracy cost of ESP-DL's constraint (GH3). |
 | G4 | PoT per-tensor, **PTQ** | Largest drop of the group. Shows how much QAT matters under coarse grids. |
 
-### Group R — Resolution sweep (best Q model)
+### Group R — Resolution sweep (best S model; Y4 reuses the outcome)
 | ID | Input | Hypothesis |
 |---|---|---|
 | R-160 | 160×120 | Latency ∝ pixels (~¼ of 320). S-bucket recall collapses. |
 | R-224 | 224×168 | Knee of the accuracy/latency curve |
 | R-320 | 320×240 | Best S recall. Max useful (camera native). |
 
-### Group M — Memory placement (best Q model) — decides RQ3 and whether W2 is worth doing
+### Group M — Memory placement (best S model) — decides RQ3 and whether W2 is worth doing (§9.0: fitting SRAM is not a goal)
 | ID | Weights | Arena | Hypothesis |
 |---|---|---|---|
 | M1 | Flash-XIP (mmap) | PSRAM | Default |
@@ -327,7 +386,7 @@ Result/Conclusion columns are the same as above for every row.
 ### Group C — Custom model
 | ID | Model | Hypothesis |
 |---|---|---|
-| C1 | Custom ReLU-only detector (MobileNet-style backbone, single-scale centre head, 320×240), QAT, KD from T0 | Narrow-task model with only ESP-NN-friendly ops matches P5 AP at ≤ B0 latency on B-test |
+| C1 | Custom ReLU-only detector (MobileNet-style backbone, single-scale centre head, 320×240), QAT, KD from T2 | Narrow-task model with only ESP-NN-friendly ops matches S4 AP at ≤ B0 latency on B-test. Only if the S and Y rows miss the latency target |
 
 ### Group L — Closed loop (Pareto set from all groups + B0, R1)
 | ID | Hypothesis |
@@ -364,17 +423,17 @@ Python env (torch, ai-edge-torch/LiteRT, onnx2tf fallback). Tiny conv model → 
 ### Phase 4 — TFLite Micro backend
 Add `esp-tflite-micro` (+ ESP-NN) components. `TfliteDetector : IDetector` with model from `ModelStore`, tensor arena via `HeapBuffer`, op resolver limited to needed ops, per-model pre/post-processing strategy (anchor decode, NMS) behind a small `IDetectionHead` interface. Run K1–K3.
 
-### Phase 5 — PTQ models (P1–P5)
-Obtain or port each model to PyTorch, check export, calibrate on A-train + B-cal, deploy, measure.
+### Phase 5 — Float models and PTQ (S0–S1, Y0–Y1, teachers T2–T3)
+Port SCRFD-0.5GF and YOLOv5n-0.5-face to PyTorch (SiLU → ReLU, drop landmarks), check export and op support, evaluate float on A-test/B-test, calibrate on A-cal + B-cal, deploy with `pack_models.py` → `flash_models.py`, measure with `run_bench.py` / `score.py` / `compare.py`. Set up teachers T2/T3 on the PC.
 
-### Phase 6 — QAT (Q1–Q5) and granularity (G1–G4)
-Shared QAT recipe (fine-tune from float, fake-quant per §2, PoT option via a custom observer). Fixed epochs and seed per model.
+### Phase 6 — QAT, distillation, fine-tune (S2–S4, Y2–Y3) and granularity (G1–G4)
+Shared QAT recipe (fine-tune from float, fake-quant per §2, PoT option via a custom observer) with an optional KD loss from the family teacher. Then fine-tune on B-cal. Fixed epochs and seed per model. Export the best S model through ESP-PPQ for S-DL.
 
-### Phase 7 — Resolution (R-*) and memory placement (M1–M4)
+### Phase 7 — Resolution (R-*, S5, Y4) and memory placement (M1–M4)
 
 ### Phase 8 — Precision (W1, W3; W2 conditional on M)
 
-### Phase 9 — Custom model (C1) with distillation from T0
+### Phase 9 — Custom model (C1), only if the S and Y rows miss the latency target
 
 ### Phase 10 — Closed-loop on the Pareto set (L-*), final report
 Fill all tables, plots and conclusions. Answer RQ1–RQ4.

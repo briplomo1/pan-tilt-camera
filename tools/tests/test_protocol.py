@@ -102,7 +102,7 @@ class StructSizeTest(unittest.TestCase):
         expected = {
             "HEADER": 8, "WIRE_FACE": 12, "WIRE_TIMING": 16, "IMAGE_HEADER": 12, "HELLO_ACK": 84,
             "MODEL_LIST_ENTRY": 48, "MODEL_INFO": 112, "INFER_RESULT": 32, "CAPTURE": 4, "FRAME_MSG": 28,
-            "TELEMETRY": 60, "SYNC_ACK": 16, "SET_PREVIEW": 8, "PREVIEW": 96, "STORE_LIST_ENTRY": 48,
+            "TELEMETRY": 76, "SET_TRACKER": 12, "SYNC_ACK": 16, "SET_PREVIEW": 8, "PREVIEW": 96, "STORE_LIST_ENTRY": 48,
             "LOAD_BLOB": 36, "BLOB_INFO": 60, "ERROR": 4, "ACK": 4, "COUNT_HEADER": 4, "SET_MODE": 4,
         }
         for name, size in expected.items():
@@ -121,6 +121,19 @@ class StructSizeTest(unittest.TestCase):
         self.assertEqual([f.box for f in preview.faces], [f.box for f in faces])
         self.assertEqual(preview.image, image)
         self.assertEqual((preview.width, preview.height, preview.format), (160, 120, p.ImageFormat.JPEG))
+
+
+class TelemetryTest(unittest.TestCase):
+    def test_parse_with_filter_state(self):
+        payload = p.TELEMETRY.pack(5_000_000, 7, 1, 1, 1, p.FILTER_ON | p.FILTER_READY, 80.0, 120.0, 81.0, 121.0,
+                                   10, 20, 60, 80, 0.95, 1, 2, 3, 45000, 82.5, 119.0, -12.0, 3.5)
+        t = p.Telemetry.parse(payload)
+        self.assertEqual((t.frame_id, t.state, t.face_count), (7, 1, 1))
+        self.assertEqual(t.target.box, [10, 20, 60, 80])
+        self.assertTrue(t.filter_on and t.filter_ready and not t.coasting)
+        self.assertAlmostEqual(t.face_pan, 82.5)
+        self.assertAlmostEqual(t.face_pan_velocity, -12.0)
+        self.assertEqual(t.timing.total_us, 45000)
 
 
 class ModelPackTest(unittest.TestCase):

@@ -10,6 +10,10 @@ Keys
     m         next model                + / -   score threshold up / down
     p         next preview format       t       pause/resume tracking (bench/track mode;
                                                 the feed stops while paused)
+    f         Kalman filter on/off (A/B runs without a reflash; the HUD shows which)
+
+The magenta cross is where the Kalman filter puts the face (from telemetry), next to the
+detected box; "coast" in the HUD means the tracker is following the prediction through a miss.
 
 A recording writes three files to --out:
     live-*.mp4            the annotated view (only the frames the preview managed to send)
@@ -39,8 +43,9 @@ from tools.common.imaging import decode  # noqa: E402
 from tools.link import protocol as p  # noqa: E402
 from tools.link.config import PROJECT_ROOT  # noqa: E402
 from tools.link.device import DeviceError, DeviceLink  # noqa: E402
+from tools.rig.controller import C as TRACKER, angle_to_offset  # noqa: E402
 
-DEADBAND = 0.06   # keep equal to kDeadband in src/Tracker.cpp
+DEADBAND = TRACKER["kDeadband"]   # read from src/Tracker.cpp
 FORMATS = {"jpeg": p.ImageFormat.JPEG, "rgb565": p.ImageFormat.RGB565BE, "gray": p.ImageFormat.GRAY8}
 SCALES = {1: 0, 2: 1, 4: 2}   # downscale factor -> shift
 
@@ -49,6 +54,7 @@ YELLOW = (40, 200, 240)
 RED = (60, 60, 230)
 WHITE = (255, 255, 255)
 GREY = (160, 160, 160)
+MAGENTA = (230, 60, 230)
 
 
 class Rate:
@@ -71,7 +77,8 @@ def score_colour(score: float) -> tuple[int, int, int]:
     return YELLOW if score >= 0.7 else (40, 140, 240)
 
 
-def draw(preview: p.Preview, image: np.ndarray, zoom: float, hud: list[str]) -> np.ndarray:
+def draw(preview: p.Preview, image: np.ndarray, zoom: float, hud: list[str],
+         telemetry: p.Telemetry | None = None) -> np.ndarray:
     width = round(preview.source_width * zoom)
     height = round(preview.source_height * zoom)
     canvas = cv2.cvtColor(cv2.resize(image, (width, height), interpolation=cv2.INTER_LINEAR), cv2.COLOR_RGB2BGR)
@@ -96,6 +103,13 @@ def draw(preview: p.Preview, image: np.ndarray, zoom: float, hud: list[str]) -> 
         if target:
             fx, fy = (x0 + x1) // 2, (y0 + y1) // 2
             cv2.line(canvas, (cx, cy), (fx, fy), GREEN, 1, cv2.LINE_AA)
+
+    # Filtered face direction, seen from where the mount pointed for this frame
+    if telemetry and telemetry.filter_on and telemetry.filter_ready:
+        fx = cx + angle_to_offset(telemetry.face_pan, preview.pan, "pan") * width / 2
+        fy = cy + angle_to_offset(telemetry.face_tilt, preview.tilt, "tilt") * height / 2
+        if 0 <= fx < width and 0 <= fy < height:
+            cv2.drawMarker(canvas, (round(fx), round(fy)), MAGENTA, cv2.MARKER_CROSS, 18, 2)
 
     # Heads-up display on a dark strip
     strip = 20 * len(hud) + 8
@@ -128,6 +142,10 @@ def telemetry_row(t: p.Telemetry, source: list[int] | None) -> dict:
         "pan": round(t.pan, 2), "tilt": round(t.tilt, 2),
         "pan_target": round(t.pan_target, 2), "tilt_target": round(t.tilt_target, 2),
         "face_count": t.face_count, "target": target, "timing_us": t.timing.as_dict(), "source": source,
+        "filter": t.filter_on, "coasting": t.coasting,
+        "face_pan": round(t.face_pan, 2) if t.filter_ready else None,
+        "face_tilt": round(t.face_tilt, 2) if t.filter_ready else None,
+        "face_pan_velocity": round(t.face_pan_velocity, 2) if t.filter_ready else None,
     }
 
 
@@ -199,12 +217,17 @@ def main() -> None:
 
     recorder: Recorder | None = None
     source: list[int] | None = None
+    recent: collections.OrderedDict[int, p.Telemetry] = collections.OrderedDict()   # by frame id
 
     def on_telemetry(packet: p.Packet) -> None:
         # Every tracker frame, unlike the preview, which skips frames while it's still sending
+        t = p.Telemetry.parse(packet.payload)
+        recent[t.frame_id] = t
+        while len(recent) > 64:
+            recent.popitem(last=False)
         active = recorder
         if active:
-            active.write_telemetry(telemetry_row(p.Telemetry.parse(packet.payload), source))
+            active.write_telemetry(telemetry_row(t, source))
 
     out_dir = Path(args.out)
     with DeviceLink(args.port) as device:
@@ -218,6 +241,8 @@ def main() -> None:
         if args.threshold is not None:
             device.set_threshold(threshold)
 
+        filter_on = bool(TRACKER["kFilterFace"])
+        device.set_tracker(filter_on, TRACKER["kLeadS"], TRACKER["kCoastS"])
         formats = list(FORMATS.values())
         fmt = FORMATS[args.format]
         mode = p.Mode.TRACK
@@ -248,9 +273,12 @@ def main() -> None:
                     view_rate.add(time.monotonic(), shown)
                     device_rate.add(preview.time_us / 1e6, preview.frame_id)
                     t = preview.timing
+                    tel = recent.get(preview.frame_id)
                     hud = [
                         f"{preview.model_id}   {preview.mode.name.lower()} / "
-                        f"{p.TRACKER_STATES.get(preview.tracker_state, '?').lower()}   threshold {threshold:.2f}",
+                        f"{p.TRACKER_STATES.get(preview.tracker_state, '?').lower()}"
+                        f"{' coast' if tel and tel.coasting else ''}   threshold {threshold:.2f}   "
+                        f"filter {'on' if filter_on else 'off'}",
                         f"device {device_rate.value():4.1f} fps   view {view_rate.value():4.1f} fps   "
                         f"detect {t.total_us / 1000:5.1f} ms",
                         f"pan {preview.pan:6.1f}  tilt {preview.tilt:6.1f}   faces {len(preview.faces)}   "
@@ -259,7 +287,7 @@ def main() -> None:
                     ]
                     if recorder:
                         hud.append(f"REC {recorder.video_path.name}")
-                    last_canvas = draw(preview, image, args.zoom, hud)
+                    last_canvas = draw(preview, image, args.zoom, hud, tel)
                     last_meta = metadata(preview)
                     source = last_meta["source"]
                     if recorder:
@@ -305,6 +333,10 @@ def main() -> None:
                         fmt = formats[(formats.index(fmt) + 1) % len(formats)]
                         device.set_preview(True, fmt, SCALES[args.scale], args.every, args.quality)
                         print(f"Preview format: {fmt.name}")
+                    elif key == ord("f"):
+                        filter_on = not filter_on
+                        device.set_tracker(filter_on, TRACKER["kLeadS"], TRACKER["kCoastS"])
+                        print(f"Kalman filter {'on' if filter_on else 'off'}")
                     elif key == ord("t"):
                         mode = p.Mode.BENCH if mode == p.Mode.TRACK else p.Mode.TRACK
                         device.set_mode(mode)

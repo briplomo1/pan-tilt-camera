@@ -7,9 +7,9 @@
 # Host tools
 __pycache__/
 .venv*/
-build/
-results/
-recordings/
-data/
+/build/
+/results/
+/recordings/
+/data/
 .ipynb_checkpoints/
 managed_components/

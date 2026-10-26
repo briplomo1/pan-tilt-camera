@@ -15,7 +15,7 @@
  */
 namespace proto {
 
-inline constexpr uint8_t kVersion = 1;
+inline constexpr uint8_t kVersion = 2;   // 2: SetTracker, Kalman state in Telemetry
 inline constexpr size_t kMaxPayload = 160 * 1024;   // a QVGA RGB565 frame plus metadata
 inline constexpr size_t kIdLength = 32;
 
@@ -34,6 +34,7 @@ enum class MsgType : uint8_t {
     SetPreview = 0x0B,
     ListStore = 0x0C,
     LoadBlob = 0x0D,
+    SetTracker = 0x0E,
 
     // Device -> host
     HelloAck = 0x81,
@@ -194,13 +195,32 @@ struct TelemetryMsg {
     uint8_t state;              // 0 scan, 1 track, 2 paused
     uint8_t faceCount;
     uint8_t hasTarget;
-    uint8_t reserved;
+    uint8_t filter;             // TelemetryFilter bits
     float pan;                  // mount angles when the frame was captured
     float tilt;
     float panTarget;            // target set this frame
     float tiltTarget;
     WireFace target;
     WireTiming timing;
+    float facePan;              // Kalman estimate of the face direction (mount degrees), if ready
+    float faceTilt;
+    float facePanVelocity;      // deg/s
+    float faceTiltVelocity;
+};
+
+// TelemetryMsg::filter
+enum TelemetryFilter : uint8_t {
+    kFilterOn = 1 << 0,
+    kFilterReady = 1 << 1,
+    kFilterCoasting = 1 << 2,
+};
+
+// Tracker controller settings for A/B runs; replies with Ack
+struct SetTrackerRequest {
+    uint8_t filter;             // 0 proportional steering, 1 Kalman filter + lead
+    uint8_t reserved[3];
+    float leadS;
+    float coastS;
 };
 
 struct SyncRequest {
@@ -291,7 +311,8 @@ static_assert(sizeof(ModelInfoMsg) == 112);
 static_assert(sizeof(InferResultMsg) == 32);
 static_assert(sizeof(CaptureRequest) == 4);
 static_assert(sizeof(FrameMsg) == 28);
-static_assert(sizeof(TelemetryMsg) == 60);
+static_assert(sizeof(TelemetryMsg) == 76);
+static_assert(sizeof(SetTrackerRequest) == 12);
 static_assert(sizeof(SyncAckMsg) == 16);
 static_assert(sizeof(SetPreviewRequest) == 8);
 static_assert(sizeof(PreviewMsg) == 96);

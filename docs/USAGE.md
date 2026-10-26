@@ -63,6 +63,7 @@ free internal RAM.
 | `+` / `-` | score threshold ±0.05 |
 | `p` | cycle preview format: JPEG → raw RGB565 → gray |
 | `t` | pause/resume tracking (the feed stops while paused) |
+| `f` | Kalman filter on/off; the magenta cross is the filter's face estimate |
 
 Options: `--format rgb565 --scale 1` sends exact pixels (lower FPS). `--every 2` sends every
 second frame. `--zoom 3` makes the window bigger.
@@ -80,7 +81,33 @@ Streaming the preview costs the device CPU and USB time. Measured runs keep it o
 | `python tools/models/pack_models.py <files…> -o build/models.bin` | build a model pack for the `model` partition |
 | `python tools/models/flash_models.py build/models.bin` | write the pack (app and calibration untouched) |
 | `python tools/models/store_check.py` | load every packed model into flash-XIP / PSRAM / internal RAM, check CRCs and leaks |
-| `python -m unittest discover -s tools/tests -t .` | host tests: COBS vectors, CRC, framing, struct sizes, pack format |
+| `python -m unittest discover -s tools/tests -t .` | host tests: protocol, metrics (cross-checked with the Pi scorer), controller mirror, virtual gimbal |
+
+Protocol v2 (2026-10-25): flash the current firmware before using these tools; v1 firmware is rejected.
+
+## Comparing models
+
+| Command | What it does |
+|---|---|
+| `python tools/bench/run_bench.py <folder or video.mp4> --model A --model B [--gt gt.json] [--show] [--record out.mp4]` | stream the same frames over USB to each model; one results JSONL + summary per model |
+| `python tools/eval/score.py results/<run>.jsonl --gt gt.json [--cal-run <cal run>.jsonl]` | AP50 with 95 % CI, AP50:95, operating point (threshold from the calibration run), recall by face size, centre error |
+| `python tools/eval/compare.py results/*.score.json --baseline espdl-msrmnp-s8 [--paired espdl-msrmnp-s8 --gt gt.json]` | one table (markdown + CSV) of accuracy, per-stage latency and memory, plus a Pareto plot |
+| `python tools/rig/virtual_gimbal.py wide.mp4 --hfov 90 --gt wide.gt.json --model A [--filter off] [--show]` | each model steers a camera window through the same wide video with the firmware's controller; slow models skip frames |
+| `python tools/eval/closed_loop.py <live-*.jsonl, clip-*.jsonl or vg-*.jsonl>` | tracking metrics: detected %, losses, centring, mount speed; with ground truth also RMS error, time on target, lock ratio, reacquire time |
+
+Kalman filter A/B on the robot: in `live_view.py` press `f` to switch the filter, `r` to record each
+condition, then compare the two `live-*.jsonl` files with `closed_loop.py`.
+
+## Building datasets
+
+| Command | What it does |
+|---|---|
+| `python tools/data/capture.py --session <name> --tag distance=2m --count 50` | stills from the robot's camera into `data/captures/<name>/` (`--video 20` for a clip) |
+| `python tools/data/autolabel.py <session, folder or video>` | YuNet (PC) proposes boxes |
+| `python tools/data/label.py <session, folder or video>` | review/correct boxes, writes `<source>.gt.json` (resumable) |
+| `python tools/data/split.py data/captures --gt <session>.gt.json ... --out data/b` | B-cal / B-test, whole sessions on one side |
+| `python tools/data/prepare_wider.py --wider <WIDER folder> --out data/a` | A-test (val), A-cal and A-train lists from WIDER FACE |
+| `python tools/data/negatives.py <photos without people> --into data/a/test` | verified no-face frames for the false-positive rate |
 
 ## How the pieces fit
 

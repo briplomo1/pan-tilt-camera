@@ -9,6 +9,14 @@
 
 enum class TrackState : uint8_t { Scan = 0, Track = 1, Paused = 2 };
 
+// Controller settings the host may change at run time (SetTracker), for A/B runs without a reflash.
+// Defaults are the frozen values in Tracker.cpp (docs/EXPERIMENT_PLAN.md §8).
+struct TrackerOptions {
+    bool filter;           // Kalman-filter the face and aim ahead; false: plain proportional steering
+    float leadS;           // aim this far past the frame's processing time
+    float coastS;          // keep following the prediction this long after a missed detection
+};
+
 // What happened in one tracker step, for telemetry and the live view
 struct TrackSample {
     uint32_t frameId = 0;
@@ -22,6 +30,14 @@ struct TrackSample {
     int targetIndex = -1;            // face being followed, -1 for none
     DetectTiming timing;
     ImageView image;                 // camera pixels; only valid during the callback
+    // Kalman estimate of the face direction (mount degrees), when the filter has one
+    bool filterOn = false;
+    bool filterReady = false;
+    bool coasting = false;           // steering on the prediction through a missed detection
+    float facePan = 0.0f;
+    float faceTilt = 0.0f;
+    float facePanVelocity = 0.0f;    // deg/s
+    float faceTiltVelocity = 0.0f;
 };
 
 class ITrackObserver {
@@ -46,8 +62,10 @@ protected:
  *  SCAN:   step pan across its range, pausing at each stop so the camera gets a
  *          sharp frame, and move tilt to a new row at each end. Face detection
  *          runs on every frame.
- *  TRACK:  steer so the face sits in the middle of the frame. If no face is seen
- *          for kLostTimeoutUs, go back to SCAN from wherever the mount is.
+ *  TRACK:  steer so the face sits in the middle of the frame. With the filter on, the face
+ *          direction is Kalman-filtered and the mount aims where the face will be; a short miss
+ *          (coastS) keeps following the prediction. If no face is seen for kLostTimeoutUs, go
+ *          back to SCAN from wherever the mount is.
  *  PAUSED: mount held still (benchmark mode); step() does nothing.
  */
 class Tracker {
@@ -70,6 +88,8 @@ private:
     AxisFilter tiltFilter_;
     int64_t filterUs_ = 0;         // capture time the filters were last updated for
     int rejects_ = 0;              // outlier detections in a row
+    bool coasting_ = false;
+    TrackerOptions options_;
 
     uint32_t frameId_ = 0;
     int64_t lastStatsUs_ = 0;
@@ -81,6 +101,9 @@ private:
     void steerToward(const Face &face, int frameW, int frameH, float panAtCapture, float tiltAtCapture,
                      int64_t captureUs, int64_t now);
     void filterFace(float facePan, float faceTilt, int64_t captureUs);
+    void coast(float panAtCapture, float tiltAtCapture, int64_t now);
+    [[nodiscard]] float aim(const AxisFilter &filter, float atCapture, float ahead, float halfFovDeg) const;
+    void setMountTarget(float pan, float tilt);
     [[nodiscard]] int pickFace(std::span<const Face> faces) const;
     [[nodiscard]] float scanRowTilt() const;
     void logStats(int64_t now);
@@ -104,4 +127,9 @@ public:
     void resume();
 
     [[nodiscard]] TrackState state() const { return state_; }
+
+    [[nodiscard]] static TrackerOptions defaultOptions();
+    [[nodiscard]] const TrackerOptions &options() const { return options_; }
+    // Takes effect from the next frame; the filter restarts from the next detection
+    void setOptions(const TrackerOptions &options);
 };

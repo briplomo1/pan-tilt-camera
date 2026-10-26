@@ -187,6 +187,10 @@ class DeviceLink:
         if not p.ACK.unpack_from(packet.payload)[1]:
             raise DeviceError(p.Msg.SET_PREVIEW, p.ErrorCode.BAD_REQUEST, "preview settings rejected")
 
+    def set_tracker(self, filter_on: bool, lead_s: float = 0.05, coast_s: float = 0.3) -> None:
+        """Tracker controller for A/B runs: Kalman filter + lead on or off (defaults: src/Tracker.cpp)."""
+        self.request(p.Msg.SET_TRACKER, p.SET_TRACKER.pack(int(filter_on), lead_s, coast_s))
+
     def infer(self, pixels: bytes, width: int, height: int, frame_id: int = 0,
               fmt: p.ImageFormat = p.ImageFormat.RGB565BE, timeout: float = 10.0) -> p.InferResult:
         payload = p.IMAGE_HEADER.pack(frame_id, width, height, int(fmt)) + pixels

@@ -83,6 +83,7 @@ void VisionLoop::dispatch(const RxPacket &packet) {
     case proto::MsgType::Subscribe: subscribe(packet); return;
     case proto::MsgType::Sync: sync(packet); return;
     case proto::MsgType::SetPreview: setPreview(packet); return;
+    case proto::MsgType::SetTracker: setTracker(packet); return;
     default: break;
     }
     if (!bench_.handle(packet, mode_)) {
@@ -149,6 +150,20 @@ void VisionLoop::setPreview(const RxPacket &packet) {
     link_.sendAck(packet.type(), ok);
 }
 
+void VisionLoop::setTracker(const RxPacket &packet) {
+    auto request = packet.as<proto::SetTrackerRequest>();
+    if (!request || request->leadS < 0.0f || request->leadS > 1.0f || request->coastS < 0.0f || request->coastS > 3.0f) {
+        link_.sendError(packet.type(), proto::ErrorCode::BadRequest, "SetTracker: lead 0-1 s, coast 0-3 s");
+        return;
+    }
+    tracker_.setOptions(TrackerOptions{
+        .filter = request->filter != 0,
+        .leadS = request->leadS,
+        .coastS = request->coastS,
+    });
+    link_.sendAck(packet.type(), true);
+}
+
 void VisionLoop::onTrackFrame(const TrackSample &sample) {
     std::string_view modelId;
     if (const IDetector *detector = slot_.get()) modelId = detector->info().id;
@@ -166,6 +181,13 @@ void VisionLoop::onTrackFrame(const TrackSample &sample) {
         msg.tiltTarget = sample.tiltTarget;
         if (sample.targetIndex >= 0) msg.target = toWire(sample.faces[sample.targetIndex]);
         msg.timing = toWire(sample.timing);
+        msg.filter = static_cast<uint8_t>((sample.filterOn ? proto::kFilterOn : 0) |
+                                          (sample.filterReady ? proto::kFilterReady : 0) |
+                                          (sample.coasting ? proto::kFilterCoasting : 0));
+        msg.facePan = sample.facePan;
+        msg.faceTilt = sample.faceTilt;
+        msg.facePanVelocity = sample.facePanVelocity;
+        msg.faceTiltVelocity = sample.faceTiltVelocity;
         // Never wait: if the queue is full the packet is dropped rather than slowing the tracker
         if (xQueueSend(telemetryQueue_, &msg, 0) != pdTRUE && ++telemetryDropped_ % 100 == 1) {
             ESP_LOGW(TAG, "Telemetry queue full (%lu dropped)", static_cast<unsigned long>(telemetryDropped_));

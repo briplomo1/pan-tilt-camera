@@ -13,7 +13,7 @@ import struct
 import zlib
 from dataclasses import dataclass, field
 
-PROTOCOL_VERSION = 1
+PROTOCOL_VERSION = 2   # 2: SetTracker, Kalman state in Telemetry
 MAX_PAYLOAD = 160 * 1024
 
 
@@ -32,6 +32,7 @@ class Msg(enum.IntEnum):
     SET_PREVIEW = 0x0B
     LIST_STORE = 0x0C
     LOAD_BLOB = 0x0D
+    SET_TRACKER = 0x0E
     # Device -> host
     HELLO_ACK = 0x81
     MODEL_LIST = 0x82
@@ -78,6 +79,11 @@ class ErrorCode(enum.IntEnum):
 
 TRACKER_STATES = {0: "SCAN", 1: "TRACK", 2: "PAUSED"}
 
+# Telemetry.filter bits
+FILTER_ON = 1 << 0
+FILTER_READY = 1 << 1
+FILTER_COASTING = 1 << 2
+
 # Struct layouts (sizes are checked against the firmware's static_asserts in the tests)
 HEADER = struct.Struct("<BBHI")                      # 8
 CRC = struct.Struct("<I")
@@ -96,7 +102,8 @@ CAPTURE = struct.Struct("<HBB")                      # 4
 FRAME_MSG = struct.Struct("<qffIHHB3x")              # 28
 SET_MODE = struct.Struct("<B3x")
 SUBSCRIBE = struct.Struct("<B3x")
-TELEMETRY = struct.Struct("<qIBBBxffffhhhhfIIII")    # 60
+TELEMETRY = struct.Struct("<qIBBBBffffhhhhfIIIIffff")  # 76
+SET_TRACKER = struct.Struct("<B3xff")               # 12
 SYNC = struct.Struct("<I")
 SYNC_ACK = struct.Struct("<I4xq")                    # 16
 SET_PREVIEW = struct.Struct("<BBBBB3x")              # 8
@@ -378,14 +385,22 @@ class Telemetry:
     pan_target: float
     tilt_target: float
     timing: Timing
+    filter_on: bool
+    filter_ready: bool
+    coasting: bool
+    face_pan: float                 # Kalman estimate of the face direction, mount degrees
+    face_tilt: float
+    face_pan_velocity: float        # deg/s
+    face_tilt_velocity: float
 
     @classmethod
     def parse(cls, payload: bytes) -> "Telemetry":
-        (time_us, frame_id, state, count, has_target, pan, tilt, pan_t, tilt_t,
-         x0, y0, x1, y1, score, pre, inf, post, total) = TELEMETRY.unpack_from(payload)
+        (time_us, frame_id, state, count, has_target, flags, pan, tilt, pan_t, tilt_t,
+         x0, y0, x1, y1, score, pre, inf, post, total, fpan, ftilt, vpan, vtilt) = TELEMETRY.unpack_from(payload)
         target = Face(x0, y0, x1, y1, score) if has_target else None
         return cls(time_us, frame_id, state, count, target, pan, tilt, pan_t, tilt_t,
-                   Timing(pre, inf, post, total))
+                   Timing(pre, inf, post, total), bool(flags & FILTER_ON), bool(flags & FILTER_READY),
+                   bool(flags & FILTER_COASTING), fpan, ftilt, vpan, vtilt)
 
 
 @dataclass
